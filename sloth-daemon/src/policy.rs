@@ -1,7 +1,7 @@
-//! Policy Gate for sloth-daemon (Phase 5).
+//! Policy Gate for sloth-daemon (Phase 5 + Phase 9).
 //!
-//! Evaluates CPU samples, evidence briefs, AI verdicts, and current system state
-//! to make deterministic decisions: `Throttle`, `Release`, or `None`.
+//! Evaluates CPU samples, evidence briefs, AI verdicts, current system state,
+//! and runtime overrides to make deterministic decisions: `Throttle`, `Release`, or `None`.
 //!
 //! Golden rule:
 //! - The AI proposes, the policy gate disposes.
@@ -11,6 +11,9 @@
 //! - Hysteresis: a throttled process is calm when its CPU stays below 50% of its
 //!   quota for a configurable number of consecutive samples (`cool_down_samples`,
 //!   default 5).
+//! - Runtime overrides: permit short-circuits to no throttle; ban adds the name
+//!   to the candidate set (all other gate checks still apply). Exact case-sensitive
+//!   match on comm. Neither override can bypass the protected list.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant};
 use crate::ai_classifier::{Class, Verdict};
 use crate::broker::ProcessBrief;
 use crate::cgroup_manager::{matches_protected_name, BUILTIN_PROTECTED_NAMES};
+use crate::ipc::OverrideStore;
 use crate::{Config, ProcessSample, ThrottleAction};
 
 /// Checks if a process is immune to throttling based on PID or protected name lists.
@@ -118,6 +122,8 @@ impl PolicyState {
 
 /// Evaluates a process sample and verdict against policy rules, returning
 /// `ThrottleAction` and an explanatory reason string for structured logging.
+///
+/// `overrides` is a read-only snapshot passed in; policy.rs has no globals.
 pub fn decide_with_reason(
     sample: &ProcessSample,
     brief: Option<&ProcessBrief>,
@@ -125,6 +131,7 @@ pub fn decide_with_reason(
     state: &PolicyState,
     config: &Config,
     now: Instant,
+    overrides: &OverrideStore,
 ) -> (ThrottleAction, &'static str) {
     // ------------------------------------------------------------------------
     // CASE A: The process is CURRENTLY THROTTLED -> Evaluate Release
@@ -201,6 +208,16 @@ pub fn decide_with_reason(
         );
     }
 
+    // 1b. Runtime override: permit short-circuits — no throttle, logged in audit.
+    //     Exact case-sensitive match on comm. Permit beats ban.
+    if overrides.is_permitted(&sample.comm) {
+        return (ThrottleAction::None, "permitted by user");
+    }
+
+    // 1c. Runtime override: ban adds the name to the candidate set.
+    //     All other gate checks (threshold, sustained, AI, cap) still apply.
+    let is_banned = overrides.is_banned(&sample.comm);
+
     // 2. Threshold check: CPU percentage must be above threshold
     if sample.cpu_percent < config.sampling.cpu_threshold_pct {
         return (ThrottleAction::None, "cpu below threshold");
@@ -211,15 +228,16 @@ pub fn decide_with_reason(
         return (ThrottleAction::None, "cpu not sustained long enough");
     }
 
-    // 4. AI Verdict checks:
+    // 4. AI Verdict checks (applied to both normal candidates and banned names):
     //    - verdict must recommend throttle
-    //    - classification must be Runaway or Background
+    //    - classification must be Runaway or Background (or banned candidate)
     //    - confidence must meet or exceed minimum threshold
     if !verdict.throttle_recommended {
         return (ThrottleAction::None, "ai does not recommend throttle");
     }
 
-    let is_candidate_class = matches!(verdict.classification, Class::Runaway | Class::Background);
+    let is_candidate_class =
+        matches!(verdict.classification, Class::Runaway | Class::Background) || is_banned;
     if !is_candidate_class {
         return (
             ThrottleAction::None,
@@ -255,8 +273,9 @@ pub fn decide(
     state: &PolicyState,
     config: &Config,
     now: Instant,
+    overrides: &OverrideStore,
 ) -> ThrottleAction {
-    decide_with_reason(sample, brief, verdict, state, config, now).0
+    decide_with_reason(sample, brief, verdict, state, config, now, overrides).0
 }
 
 // ============================================================================
@@ -299,6 +318,7 @@ mod tests {
             protected: crate::ProtectedConfig {
                 extra_names: vec!["critical_daemon".to_string()],
             },
+            ipc: crate::ipc::IpcConfig::default(),
         }
     }
 
@@ -560,6 +580,7 @@ mod tests {
                 &tc.state,
                 &config,
                 now,
+                &OverrideStore::default(),
             );
             assert_eq!(
                 action, tc.expected_action,

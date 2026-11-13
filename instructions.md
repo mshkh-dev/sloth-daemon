@@ -12,6 +12,7 @@ You are building **sloth-daemon**: a Rust Linux daemon that uses an eBPF probe (
    - Writing or changing anything in `sloth-ebpf/` → `ebpf-probe-builder.md`
    - Writing or changing `cgroup_manager.rs` or anything touching `/sys/fs/cgroup` → `cgroup-enforcer.md`
    - Writing or changing `ai_classifier.rs` or anything calling Ollama → `ollama-bridge.md`
+   - Writing or changing the IPC server, `sloth-proto`, `sloth-ui`, or anything touching the control socket or overrides file → `ipc-and-tui.md`
 4. If the blueprint, these instructions, and a skill disagree, stop and ask the user. Do not choose silently.
 
 ## 2. Working Style
@@ -39,6 +40,10 @@ You are building **sloth-daemon**: a Rust Linux daemon that uses an eBPF probe (
 | Errors | `anyhow` in the binary, `thiserror` for module error types |
 | Logging | `tracing` and `tracing-subscriber` (never `println!` for operational output) |
 | CLI | `clap` |
+| TUI (client crate only) | `ratatui` and `crossterm` |
+| Shared protocol crate | `sloth-proto` (depends on `serde` and `serde_json` only) |
+
+`sloth-daemon` must never depend on `ratatui` or `crossterm`.
 
 Do not add dependencies outside this list without asking. When you add one, state why in one sentence.
 
@@ -96,6 +101,13 @@ PID 1, the daemon itself and its parent, kernel threads (no `/proc/<pid>/exe`, o
 ### 5.5 Dangerous operations need the user
 Stop and ask before: running anything with `sudo`, running the daemon with `dry_run = false`, deleting files outside `target/`, modifying anything outside the repo directory, changing kernel parameters (`sysctl`), or loading or unloading kernel modules.
 
+### 5.6 The control socket
+- The socket is a local Unix socket only. Never bind a TCP or network listener.
+- The socket can change policy lists only. No request may throttle, release, signal or otherwise act on a specific PID.
+- Overrides can never remove or bypass the protected list or the policy gate.
+- Treat every request as untrusted input: cap its size, parse strictly, validate names, ignore unknown fields.
+- If IPC fails, log a warning and keep running. The daemon must not depend on IPC.
+
 ## 6. Rust Code Standards
 
 - No `unwrap()` or `expect()` on runtime paths in user space. Use `?` with context (`anyhow::Context`). Tests may unwrap.
@@ -118,6 +130,8 @@ Stop and ask before: running anything with `sudo`, running the daemon with `dry_
 | `sloth-daemon/src/policy.rs` | Policy Gate: deterministic decisions (`decide`), `PolicyState`, hysteresis, TTL | Raw HTTP calls, raw cgroup file writes |
 | `sloth-daemon/src/ai_classifier.rs` | Ollama HTTP, prompt, parsing, cache, fallback | Cgroup logic, process killing |
 | `sloth-daemon/src/cgroup_manager.rs` | All `/sys/fs/cgroup` access, protected list enforcement, release logic | HTTP, AI logic |
+| `sloth-daemon/src/ipc.rs` | Socket server, request handling, decision ring buffer, overrides store | Cgroup writes, HTTP, UI code |
+| `sloth-ui/src/main.rs` | Terminal client and rendering | Any daemon logic or cgroup access |
 
 If `main.rs` grows too large, ask before adding new modules. Do not move files without approval.
 

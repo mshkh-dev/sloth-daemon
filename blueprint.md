@@ -277,4 +277,54 @@ The project is done when **every** box below is true and has been verified by ru
 ### Documentation
 - [x] `README.md` explains installation, privileges, dry-run, and configuration.
 - [x] A systemd unit example is included.
-- [x] Every decision the daemon makes is explained in its logs.
+- [x] Every decision the daemon makes is explained in its logs.### Feature 1: Interactive TUI / Control Center (The Best "UX" Upgrade)
+
+Right now, interaction is mostly config-file driven (`sloth.toml`) and logs.
+
+- **The v2 Feature:** A lightweight terminal user interface (TUI) built in Rust (using `ratatui`) that lets you view live, throttled processes in real-time, temporarily whitelist/blacklist processes with a keystroke, or manually inspect *why* the AI or policy engine decided to slow a specific PID down.
+
+- **Why it fits:** It keeps the tool local, transparent, and terminal-native (matching the Rust/eBPF ecosystem) without needing a heavy web dashboard or background bloat.
+
+### Feature 2: Dynamic Policy Learning / Auto-Profiling
+
+Users have to manually specify `throttle_candidates` in their config.
+
+- **The v2 Feature:** Allow `sloth-daemon` to maintain a local, lightweight SQLite ledger of application behavior over time. If it notices that `cargo build` or a specific heavy python script constantly gets flagged and subsequently user-approved for throttling, it can automatically learn a local profile for it.
+
+- **Why it fits:** It reduces configuration friction and makes the daemon feel truly autonomous without leaking data or requiring cloud connectivity.
+
+
+
+It is a great upgrade—provided you build it as an **interactive control plane and audit log**, not a generic system resource monitor.
+
+If you put CPU bar graphs, RAM gauges, and network throughput charts into your TUI, you are competing directly with `btop` and `htop`—and you will lose. Those tools are built purely for real-time telemetry visualization.
+
+For a background daemon that uses local AI and behavioral profiling to make autonomous decisions, a TUI solves a problem `btop` cannot: **observability and human-in-the-loop training.**
+
+### Where `btop`/`htop` Stop vs. Where `sloth` Starts
+
+- **`btop` shows you *what* is happening:** "Process `cargo` is using 98% CPU."
+
+- **`sloth` TUI shows you *why* it intervened and lets you train Option 3:** "Process `cargo` was throttled to 40% `cpu.max` because it lacked interactive TTY focus and matched a repetitive compute pattern. **[P]ermit burst** | **[B]an** | **[I]nspect AI reasoning**."
+
+### How to Architect It So It Doesn't Bloat the Daemon
+
+A background daemon should stay lean and headless. You should **not** compile `ratatui` directly into the daemon binary or run UI rendering loops inside the core service.
+
+1. **Keep the Daemon Strictly Headless:** `sloth-daemon` runs silently in the background via systemd, collecting eBPF metrics, querying the AI, writing to the SQLite behavioral ledger (Option 3), and managing cgroups.
+
+2. **Expose a Local Unix Domain Socket:** Have `sloth-daemon` expose an IPC socket (e.g., `/run/sloth/sloth.sock`) using lightweight JSON or MessagePack/bincode over Tokio.
+
+3. **Make the TUI a Subcommand Client (`sloth top` or `sloth ui`):** When you run `sloth ui`, the CLI connects to the daemon's socket on demand. When you close the TUI, zero UI overhead remains in memory.
+
+### What the TUI Screens Should Actually Contain
+
+To complement Option 3 (Local Behavioral Profiling) without overlapping with `btop`, limit the TUI to three focused views:
+
+- **Active Cgroup Cages:** Only lists processes currently being governed or watched by `sloth`—showing their current `cpu.max` quota, duration throttled, and the specific trigger reason.
+
+- **AI & Policy Audit Stream:** A live feed of the daemon's reasoning (e.g., *"Ignored `ffmpeg` — matched user-approved media profile"* or *"Throttled `tracker-miner-fs` — high background I/O + CPU loop"*).
+
+- **Profile Manager (The Option 3 Trainer):** A table of learned application profiles stored in SQLite where you can flip a process between **Auto-Learn**, **Always Throttle**, or **Whitelist** with a single keypress, immediately updating the daemon's ruleset without manually editing `sloth.toml`.
+
+Pairing Option 3 with a client-side TUI turns `sloth-daemon` from a "black box" background service into a transparent, self-training tool—something general system monitors aren't designed to do.

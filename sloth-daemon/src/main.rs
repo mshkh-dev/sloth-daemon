@@ -6,6 +6,7 @@
 pub mod ai_classifier;
 pub mod broker;
 pub mod cgroup_manager;
+pub mod ipc;
 pub mod policy;
 
 use std::collections::HashMap as StdHashMap;
@@ -79,6 +80,8 @@ pub struct Config {
     pub ai: AiConfig,
     /// Process protection options.
     pub protected: ProtectedConfig,
+    /// IPC control socket options.
+    pub ipc: ipc::IpcConfig,
 }
 
 impl Default for Config {
@@ -89,6 +92,7 @@ impl Default for Config {
             throttle: ThrottleConfig::default(),
             ai: AiConfig::default(),
             protected: ProtectedConfig::default(),
+            ipc: ipc::IpcConfig::default(),
         }
     }
 }
@@ -935,6 +939,36 @@ async fn main() -> ExitCode {
         default_hook(info);
     }));
 
+    // Initialize IPC subsystem
+    let allowed_gid = config
+        .ipc
+        .group
+        .as_deref()
+        .and_then(ipc::lookup_gid_by_name);
+    let authorizer = ipc::default_authorizer(allowed_gid);
+    let (ipc_server_handle, ipc_state) = match ipc::start_ipc_server(
+        &config.ipc,
+        config.dry_run,
+        env!("CARGO_PKG_VERSION"),
+        &config.ai.provider,
+        config.throttle.max_concurrent,
+        authorizer,
+    ) {
+        Ok(Some((handle, state))) => (Some(handle), state),
+        Ok(None) | Err(_) => {
+            let mut fallback_state = ipc::IpcState::new(
+                env!("CARGO_PKG_VERSION").to_string(),
+                config.dry_run,
+                config.ipc.history,
+                config.ai.provider.clone(),
+                config.throttle.max_concurrent,
+            );
+            fallback_state.overrides_path = config.ipc.overrides_path.clone();
+            fallback_state.load_overrides_from_disk();
+            (None, Arc::new(std::sync::Mutex::new(fallback_state)))
+        }
+    };
+
     info!(
         interval_secs = config.sampling.interval_secs,
         "CPU observation probe active. Starting sampling loop..."
@@ -1077,6 +1111,10 @@ async fn main() -> ExitCode {
                     };
 
                     // Policy gate evaluation
+                    let overrides_snapshot = {
+                        let guard = ipc_state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.overrides_snapshot()
+                    };
                     let (action, reason) = policy::decide_with_reason(
                         sample,
                         brief.as_ref(),
@@ -1084,6 +1122,7 @@ async fn main() -> ExitCode {
                         &policy_state,
                         &config,
                         now,
+                        &overrides_snapshot,
                     );
 
                     // One structured INFO log per decision
@@ -1098,6 +1137,29 @@ async fn main() -> ExitCode {
                         reason = %reason,
                         "Policy decision"
                     );
+
+                    // Record decision for IPC audit ring buffer
+                    let epoch_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let action_str = match action {
+                        ThrottleAction::Throttle { .. } => "Throttle",
+                        ThrottleAction::Release { .. } => "Release",
+                        ThrottleAction::None => "None",
+                    };
+                    {
+                        let mut ipc_guard = ipc_state.lock().unwrap_or_else(|e| e.into_inner());
+                        ipc_guard.record_decision(sloth_proto::DecisionRecord {
+                            timestamp_epoch_secs: epoch_now,
+                            pid: sample.pid,
+                            comm: sample.comm.clone(),
+                            cpu_percent: sample.cpu_percent,
+                            action: action_str.to_string(),
+                            reason: reason.to_string(),
+                            confidence: Some(verdict.confidence),
+                        });
+                    }
 
                     // Apply decision
                     match action {
@@ -1152,9 +1214,59 @@ async fn main() -> ExitCode {
                         reason = %exited_reason,
                         "Cleaned up exited throttled process"
                     );
+
+                    let epoch_now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    {
+                        let mut ipc_guard = ipc_state.lock().unwrap_or_else(|e| e.into_inner());
+                        ipc_guard.record_decision(sloth_proto::DecisionRecord {
+                            timestamp_epoch_secs: epoch_now,
+                            pid: exited_pid,
+                            comm: "unknown".to_string(),
+                            cpu_percent: 0.0,
+                            action: "Release".to_string(),
+                            reason: exited_reason.to_string(),
+                            confidence: None,
+                        });
+                    }
+                }
+
+                // Update active cage snapshots for IPC
+                let ttl_duration = Duration::from_secs(config.throttle.ttl_secs);
+                let cages_snapshot: Vec<sloth_proto::CageRecord> = policy_state
+                    .throttled
+                    .values()
+                    .map(|p| {
+                        let elapsed = now.duration_since(p.throttled_at);
+                        let ttl_remaining = ttl_duration
+                            .checked_sub(elapsed)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        sloth_proto::CageRecord {
+                            pid: p.pid,
+                            comm: p.comm.clone(),
+                            quota_pct: p.quota_pct as u32,
+                            throttled_secs: elapsed.as_secs(),
+                            ttl_remaining_secs: ttl_remaining,
+                            reason: "Throttled by policy gate".to_string(),
+                        }
+                    })
+                    .collect();
+                {
+                    let mut ipc_guard = ipc_state.lock().unwrap_or_else(|e| e.into_inner());
+                    ipc_guard.update_cages(cages_snapshot);
                 }
             }
         }
+    }
+
+    if let Some(h) = ipc_server_handle {
+        h.abort();
+    }
+    if config.ipc.enabled && config.ipc.socket_path.exists() {
+        let _ = fs::remove_file(&config.ipc.socket_path);
     }
 
     cgroup_mgr.release_all();
