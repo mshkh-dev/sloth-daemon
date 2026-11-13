@@ -1567,6 +1567,7 @@ mod tests {
                 &policy_state,
                 &config,
                 start + std::time::Duration::from_secs((tick * 2) as u64),
+                &crate::ipc::OverrideStore::default(),
             );
 
             if matches!(action, ThrottleAction::Throttle { .. }) {

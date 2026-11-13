@@ -221,6 +221,9 @@ pub struct IpcState {
     pub overrides: OverrideStore,
     /// Path to the overrides persistence file.
     pub overrides_path: PathBuf,
+    /// Combined protected names: BUILTIN_PROTECTED_NAMES + extra_names + never_throttle.
+    /// Used by the Override handler to reject attempts to override protected processes.
+    pub protected_names: Vec<String>,
 }
 
 impl IpcState {
@@ -246,12 +249,19 @@ impl IpcState {
             cap,
             overrides: OverrideStore::default(),
             overrides_path: PathBuf::from(DEFAULT_OVERRIDES_PATH),
+            protected_names: Vec::new(),
         }
     }
 
     /// Load overrides from the configured path; called after construction.
     pub fn load_overrides_from_disk(&mut self) {
         self.overrides = load_overrides(&self.overrides_path.clone());
+    }
+
+    /// Set the combined protected names list (BUILTIN + extra + never_throttle).
+    /// Called once at startup from main before the IPC server processes any requests.
+    pub fn set_protected_names(&mut self, names: Vec<String>) {
+        self.protected_names = names;
     }
 
     /// Return a snapshot of the current overrides store (cloned, for read-only access outside the lock).
@@ -671,8 +681,10 @@ async fn handle_connection(
         // Mutating: requires root or configured group.
         Request::Override { name, mode } => {
             // Phase 9 mutating requests require root (uid 0) or the configured group.
-            if peer_uid != 0 {
-                warn!(peer_uid, name = %name, "Override request rejected: peer not root");
+            // The outer authorizer already admitted only root/group, so re-use it here
+            // rather than hard-coding uid==0.
+            if !authorizer(peer_uid, peer_gid) {
+                warn!(peer_uid, name = %name, "Override request rejected: peer not authorized");
                 let resp: Response<()> = Response::err("override requires root or configured group");
                 serde_json::to_string(&resp)
             } else {
@@ -698,7 +710,7 @@ async fn handle_override_request(
     name: String,
     mode: OverrideMode,
 ) -> Result<String, serde_json::Error> {
-    use crate::cgroup_manager::{matches_protected_name, BUILTIN_PROTECTED_NAMES};
+    use crate::cgroup_manager::matches_protected_name;
 
     // 1. Validate name.
     if let Err(e) = validate_name(&name) {
@@ -707,7 +719,15 @@ async fn handle_override_request(
     }
 
     // 2. Protected names are rejected for both permit and ban before any other check.
-    let all_protected: Vec<String> = BUILTIN_PROTECTED_NAMES.iter().map(|s| s.to_string()).collect();
+    //    Use the combined protected_names list from IpcState (BUILTIN + extra + never_throttle).
+    let (all_protected, overrides_path, current_overrides) = {
+        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            guard.protected_names.clone(),
+            guard.overrides_path.clone(),
+            guard.overrides.clone(),
+        )
+    };
     if matches_protected_name(&name, &all_protected) {
         warn!(name = %name, "Override rejected: name is in the protected list");
         return serde_json::to_string(&Response::<()>::err(
@@ -715,17 +735,8 @@ async fn handle_override_request(
         ));
     }
 
-    // 3. Take a snapshot of the current store (no I/O under lock).
-    let (mut new_store, overrides_path, current_len) = {
-        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            guard.overrides.clone(),
-            guard.overrides_path.clone(),
-            guard.overrides.len(),
-        )
-    };
-
-    // 4. Apply the requested change to the snapshot.
+    // 3. Apply the requested change to the snapshot.
+    let mut new_store = current_overrides;
     match &mode {
         OverrideMode::Permit => {
             new_store.bans.remove(&name);
@@ -741,22 +752,21 @@ async fn handle_override_request(
         }
     }
 
-    // 5. Check cap (after applying, if adding a new entry).
+    // 4. Check cap (after applying, if adding a new entry).
     if new_store.len() > MAX_OVERRIDES {
         warn!(name = %name, "Override rejected: would exceed max 200 entries");
         return serde_json::to_string(&Response::<()>::err(
             "maximum override entries (200) reached",
         ));
     }
-    let _ = current_len; // suppress unused warning
 
-    // 6. Persist FIRST (outside the lock, all I/O here).
+    // 5. Persist FIRST (outside the lock, all I/O here).
     if let Err(e) = persist_overrides(&new_store, &overrides_path) {
         warn!(name = %name, error = %e, "Override persist failed; leaving memory unchanged");
         return serde_json::to_string(&Response::<()>::err("failed to persist override"));
     }
 
-    // 7. Swap in-memory only after successful write.
+    // 6. Swap in-memory only after successful write.
     {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         guard.overrides = new_store;

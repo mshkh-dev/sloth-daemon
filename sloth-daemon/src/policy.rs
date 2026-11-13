@@ -625,6 +625,7 @@ mod tests {
                 &state,
                 &config,
                 now,
+                &OverrideStore::default(),
             );
             assert_eq!(
                 action,
@@ -658,7 +659,7 @@ mod tests {
         // Samples 1 through 4: cool-down in progress, must NOT release yet
         for i in 1..=4 {
             let (action, reason) =
-                decide_with_reason(&calm_sample, None, &verdict_runaway(), &state, &config, now);
+                decide_with_reason(&calm_sample, None, &verdict_runaway(), &state, &config, now, &OverrideStore::default());
             assert_eq!(
                 action,
                 ThrottleAction::None,
@@ -671,7 +672,7 @@ mod tests {
 
         // Sample 5: completes cool_down_samples (5) -> triggers Release!
         let (action, reason) =
-            decide_with_reason(&calm_sample, None, &verdict_runaway(), &state, &config, now);
+            decide_with_reason(&calm_sample, None, &verdict_runaway(), &state, &config, now, &OverrideStore::default());
         assert_eq!(
             action,
             ThrottleAction::Release { pid: 999 },
@@ -709,6 +710,7 @@ mod tests {
             &state,
             &config,
             now,
+            &OverrideStore::default(),
         );
         assert_eq!(action, ThrottleAction::None);
         state.update_calm(999, false);
@@ -741,6 +743,7 @@ mod tests {
             &state,
             &config,
             future,
+            &OverrideStore::default(),
         );
         assert_eq!(action, ThrottleAction::Release { pid: 999 });
         assert_eq!(reason, "throttle TTL expired");
@@ -765,7 +768,7 @@ mod tests {
         };
 
         let (action, reason) =
-            decide_with_reason(&sample, None, &verdict_runaway(), &state, &config, now);
+            decide_with_reason(&sample, None, &verdict_runaway(), &state, &config, now, &OverrideStore::default());
         assert_eq!(action, ThrottleAction::Release { pid: 999 });
         assert_eq!(reason, "process became protected");
     }
