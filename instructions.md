@@ -42,7 +42,9 @@ You are building **sloth-daemon**: a Rust Linux daemon that uses an eBPF probe (
 | CLI | `clap` |
 | TUI (client crate only) | `ratatui` and `crossterm` |
 | Shared protocol crate | `sloth-proto` (depends on `serde` and `serde_json` only) |
-
+| TUI (client crate only) | `ratatui` and `crossterm` |
+| Shared protocol crate | `sloth-proto` (depends on `serde` and `serde_json` only) |
+- Writing or changing the IPC server, `sloth-proto`, `sloth-ui`, or anything touching the control socket or overrides file → `ipc-and-tui.md`
 `sloth-daemon` must never depend on `ratatui` or `crossterm`.
 
 Do not add dependencies outside this list without asking. When you add one, state why in one sentence.
@@ -108,6 +110,13 @@ Stop and ask before: running anything with `sudo`, running the daemon with `dry_
 - Treat every request as untrusted input: cap its size, parse strictly, validate names, ignore unknown fields.
 - If IPC fails, log a warning and keep running. The daemon must not depend on IPC.
 
+   ### 5.6 The control socket
+   - The socket is a local Unix socket only. Never bind a TCP or network listener.
+   - The socket can change policy lists only. No request may throttle, release, signal or otherwise act on a specific PID.
+   - Overrides can never remove or bypass the protected list or the policy gate.
+   - Treat every request as untrusted input: cap its size, parse strictly, validate names, ignore unknown fields.
+   - If IPC fails, log a warning and keep running. The daemon must not depend on IPC.
+
 ## 6. Rust Code Standards
 
 - No `unwrap()` or `expect()` on runtime paths in user space. Use `?` with context (`anyhow::Context`). Tests may unwrap.
@@ -130,6 +139,8 @@ Stop and ask before: running anything with `sudo`, running the daemon with `dry_
 | `sloth-daemon/src/policy.rs` | Policy Gate: deterministic decisions (`decide`), `PolicyState`, hysteresis, TTL | Raw HTTP calls, raw cgroup file writes |
 | `sloth-daemon/src/ai_classifier.rs` | Ollama HTTP, prompt, parsing, cache, fallback | Cgroup logic, process killing |
 | `sloth-daemon/src/cgroup_manager.rs` | All `/sys/fs/cgroup` access, protected list enforcement, release logic | HTTP, AI logic |
+| `sloth-daemon/src/ipc.rs` | Socket server, request handling, decision ring buffer, overrides store | Cgroup writes, HTTP, UI code |
+| `sloth-ui/src/main.rs` | Terminal client and rendering | Any daemon logic or cgroup access |
 | `sloth-daemon/src/ipc.rs` | Socket server, request handling, decision ring buffer, overrides store | Cgroup writes, HTTP, UI code |
 | `sloth-ui/src/main.rs` | Terminal client and rendering | Any daemon logic or cgroup access |
 
@@ -166,3 +177,25 @@ Stop and ask the user, with a specific question and a recommended default, if:
 ## 12. Definition of "Finished" for Any Task
 
 A task is finished only when: it compiles, `cargo fmt` and `clippy` are clean, relevant tests pass, the behaviour was actually exercised (or you clearly state it needs the user to run it with privileges), and your summary says exactly what was and was not verified.
+
+## 13. Navigating the Repo Cheaply (Hard Rule)
+
+Tokens are limited. Do not explore the repo broadly.
+
+- **Never search or read `target/`, `.git/`, or `Cargo.lock`.** Always exclude them: `grep -rn --exclude-dir=target --exclude-dir=.git ...`. Never run `grep -r` or `find` from the repo root without `--exclude-dir=target`.
+- **Go straight to the file.** Use the map below. Search inside ONE named file (`grep -n 'name' path/to/file.rs`), then read only the lines you need with an offset and limit. Do not read whole large files.
+- **Repo map:**
+  - `sloth-ebpf/src/main.rs`: kernel probe only
+  - `sloth-proto/src/lib.rs`: IPC wire types (Request, Response, Status, overrides)
+  - `sloth-daemon/src/main.rs`: config, startup, control loop, signals
+  - `sloth-daemon/src/policy.rs`: the policy gate (pure function)
+  - `sloth-daemon/src/broker.rs`: ProcessBrief evidence and rules verdict
+  - `sloth-daemon/src/ai_classifier.rs`: Ollama bridge, rules provider
+  - `sloth-daemon/src/cgroup_manager.rs`: all cgroup access
+  - `sloth-daemon/src/ipc.rs`: socket server, ring buffer, override store
+  - `sloth-ui/src/main.rs`: terminal client
+  - `scripts/`: check scripts, run by the user. `v2/PROGRESS.md`: resume notes.
+- **Orientation budget: at most 5 search/read calls before you act.** If you can't find something in that budget, do not widen the search. Stop and ask me for the file or the line, in one sentence.
+- **Don't re-read what you already read this session.** Don't re-run a search that already answered the question.
+- **Don't list directories, run `tree`, or print `git log`/`git diff` of the whole repo.** Use `git status --short` and `git diff --stat -- <path>` only when needed.
+- When the user pastes a failing output, start from that output, not from a fresh search.

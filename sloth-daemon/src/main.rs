@@ -954,7 +954,20 @@ async fn main() -> ExitCode {
         config.throttle.max_concurrent,
         authorizer,
     ) {
-        Ok(Some((handle, state))) => (Some(handle), state),
+        Ok(Some((handle, state))) => {
+            // Populate combined protected names for override rejection
+            let mut all_protected: Vec<String> = cgroup_manager::BUILTIN_PROTECTED_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            all_protected.extend(config.protected.extra_names.clone());
+            all_protected.extend(config.ai.never_throttle.clone());
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_protected_names(all_protected);
+            (Some(handle), state)
+        }
         Ok(None) | Err(_) => {
             let mut fallback_state = ipc::IpcState::new(
                 env!("CARGO_PKG_VERSION").to_string(),
@@ -965,6 +978,13 @@ async fn main() -> ExitCode {
             );
             fallback_state.overrides_path = config.ipc.overrides_path.clone();
             fallback_state.load_overrides_from_disk();
+            let mut all_protected: Vec<String> = cgroup_manager::BUILTIN_PROTECTED_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            all_protected.extend(config.protected.extra_names.clone());
+            all_protected.extend(config.ai.never_throttle.clone());
+            fallback_state.set_protected_names(all_protected);
             (None, Arc::new(std::sync::Mutex::new(fallback_state)))
         }
     };
@@ -1061,11 +1081,25 @@ async fn main() -> ExitCode {
                         uptime_secs,
                     };
 
+                    // Snapshot overrides for classification and policy gate
+                    let overrides_snapshot = {
+                        let guard = ipc_state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.overrides_snapshot()
+                    };
+
+                    // Compute effective candidates: config throttle_candidates + banned names
+                    let mut effective_ai_config = config.ai.clone();
+                    for banned in &overrides_snapshot.bans {
+                        if !effective_ai_config.throttle_candidates.contains(banned) {
+                            effective_ai_config.throttle_candidates.push(banned.clone());
+                        }
+                    }
+
                     let brief = broker::build_brief(
                         sample,
                         sampler_history.get(sample.pid),
                         &sys_ctx,
-                        &config.ai,
+                        &effective_ai_config,
                     );
 
                     // Obtain classification verdict asynchronously / from cache
@@ -1111,10 +1145,6 @@ async fn main() -> ExitCode {
                     };
 
                     // Policy gate evaluation
-                    let overrides_snapshot = {
-                        let guard = ipc_state.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.overrides_snapshot()
-                    };
                     let (action, reason) = policy::decide_with_reason(
                         sample,
                         brief.as_ref(),
@@ -1716,5 +1746,91 @@ mod tests {
             "Runaway with confidence 0.85 must recommend throttle"
         );
         // Critically: this entire test required zero network calls.
+    }
+
+    #[test]
+    fn test_override_ban_classification_pipeline() {
+        // Real classification path: broker preliminary verdict -> rules provider -> policy
+        use crate::broker;
+        use crate::ipc::OverrideStore;
+
+        let mut config = Config::default();
+        config.ai.provider = "rules".to_string();
+        // Name is NOT in config throttle_candidates
+        config.ai.throttle_candidates = vec!["zzz-none".to_string()];
+        config.ai.candidates_confidence = 0.85;
+        config.sampling.sustained_secs = 30;
+        config.sampling.cpu_threshold_pct = 50.0;
+
+        let now = Instant::now();
+        let target_comm = "custom_worker";
+
+        // Helper closure to evaluate through the real path:
+        // effective candidate set computation -> broker evaluation -> rules verdict -> policy gate
+        let run_pipeline = |sustained_secs: u32, overrides: &OverrideStore| {
+            let sample = ProcessSample {
+                pid: 12345,
+                comm: target_comm.to_string(),
+                cpu_percent: 95.0,
+                sustained_secs,
+                window_secs: 2,
+            };
+
+            let mut effective_ai_config = config.ai.clone();
+            for banned in &overrides.bans {
+                if !effective_ai_config.throttle_candidates.contains(banned) {
+                    effective_ai_config.throttle_candidates.push(banned.clone());
+                }
+            }
+
+            let rules = broker::evaluate_preliminary_rules(
+                &sample.comm,
+                broker::NameCategory::Unknown,
+                broker::NameCategory::Unknown,
+                sample.sustained_secs,
+                &effective_ai_config,
+            );
+            let verdict = rules.to_verdict();
+
+            let policy_state = policy::PolicyState::new();
+            policy::decide_with_reason(
+                &sample,
+                None,
+                &verdict,
+                &policy_state,
+                &config,
+                now,
+                overrides,
+            )
+        };
+
+        // 1. Banned + sustained load -> Throttle at 0.85
+        let mut store_banned = OverrideStore::default();
+        store_banned.bans.insert(target_comm.to_string());
+        let (action, _reason) = run_pipeline(40, &store_banned);
+        assert_eq!(
+            action,
+            ThrottleAction::Throttle {
+                pid: 12345,
+                quota_pct: config.throttle.quota_pct
+            }
+        );
+
+        // 2. Banned but not sustained -> no action
+        let (action, _reason) = run_pipeline(10, &store_banned);
+        assert_eq!(action, ThrottleAction::None);
+
+        // 3. Same name unbanned (not banned) -> no action
+        let store_unbanned = OverrideStore::default();
+        let (action, _reason) = run_pipeline(40, &store_unbanned);
+        assert_eq!(action, ThrottleAction::None);
+
+        // 4. Banned + permitted -> no action (permit wins and short-circuits)
+        let mut store_both = OverrideStore::default();
+        store_both.bans.insert(target_comm.to_string());
+        store_both.permits.insert(target_comm.to_string());
+        let (action, reason) = run_pipeline(40, &store_both);
+        assert_eq!(action, ThrottleAction::None);
+        assert_eq!(reason, "permitted by user");
     }
 }

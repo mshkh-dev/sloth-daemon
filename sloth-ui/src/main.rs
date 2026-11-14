@@ -21,7 +21,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState},
     Frame, Terminal,
 };
-use sloth_proto::{CageRecord, DecisionRecord, Request, RequestEnvelope, Response, StatusData};
+use sloth_proto::{
+    CageRecord, DecisionRecord, OverrideEntry, OverrideMode, Request, RequestEnvelope, Response,
+    StatusData,
+};
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/sloth/sloth.sock";
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -39,7 +42,9 @@ pub struct AppState {
     pub status: Option<StatusData>,
     pub cages: Vec<CageRecord>,
     pub decisions: Vec<DecisionRecord>,
+    pub overrides: Vec<OverrideEntry>,
     pub error_message: Option<String>,
+    pub feedback_message: Option<(String, Instant)>,
     pub last_poll: Instant,
     pub cages_table_state: TableState,
     pub audit_table_state: TableState,
@@ -59,7 +64,9 @@ impl AppState {
             status: None,
             cages: Vec::new(),
             decisions: Vec::new(),
+            overrides: Vec::new(),
             error_message: None,
+            feedback_message: None,
             // Trigger poll immediately
             last_poll: Instant::now() - Duration::from_secs(5),
             cages_table_state: cages_state,
@@ -126,6 +133,11 @@ impl AppState {
                         .select(Some(self.decisions.len() - 1));
                 }
             }
+        }
+
+        // Query overrides
+        if let Ok(o) = query_socket::<Vec<OverrideEntry>>(path, Request::Overrides) {
+            self.overrides = o;
         }
     }
 
@@ -225,6 +237,68 @@ impl AppState {
             }
         }
     }
+
+    pub fn selected_comm(&self) -> Option<String> {
+        match self.active_tab {
+            ActiveTab::Cages => self
+                .cages_table_state
+                .selected()
+                .and_then(|idx| self.cages.get(idx).map(|c| c.comm.clone())),
+            ActiveTab::Audit => self
+                .audit_table_state
+                .selected()
+                .and_then(|idx| self.decisions.get(idx).map(|d| d.comm.clone())),
+        }
+    }
+
+    pub fn override_indicator(&self, comm: &str) -> &'static str {
+        for o in &self.overrides {
+            if o.name == comm {
+                return match o.mode {
+                    OverrideMode::Permit => "[P] ",
+                    OverrideMode::Ban => "[B] ",
+                    OverrideMode::Clear => "",
+                };
+            }
+        }
+        ""
+    }
+
+    pub fn set_feedback(&mut self, msg: String) {
+        self.feedback_message = Some((msg, Instant::now()));
+    }
+
+    pub fn send_override(&mut self, mode: OverrideMode) {
+        let comm = match self.selected_comm() {
+            Some(c) => c,
+            None => {
+                self.set_feedback("no process selected".to_string());
+                return;
+            }
+        };
+
+        let mode_desc = match mode {
+            OverrideMode::Permit => "Permitted",
+            OverrideMode::Ban => "Banned",
+            OverrideMode::Clear => "Cleared",
+        };
+
+        let req = Request::Override {
+            name: comm.clone(),
+            mode,
+        };
+
+        match query_socket_mutation(&self.socket_path, req) {
+            Ok(_) => {
+                self.set_feedback(format!("{mode_desc}: {comm}"));
+                // Refresh data immediately
+                self.fetch_all();
+            }
+            Err(e) => {
+                self.set_feedback(format!("Error: {e}"));
+            }
+        }
+    }
 }
 
 /// Send request and parse response over a fresh blocking Unix connection.
@@ -277,6 +351,60 @@ fn query_socket<T: serde::de::DeserializeOwned>(path: &Path, req: Request) -> Re
     }
 
     resp.data.ok_or_else(|| "missing response data".to_string())
+}
+
+/// Send a mutating request over Unix socket expecting ok: true.
+fn query_socket_mutation(path: &Path, req: Request) -> Result<(), String> {
+    let mut stream = match UnixStream::connect(path) {
+        Ok(s) => s,
+        Err(err) => {
+            return match err.kind() {
+                io::ErrorKind::PermissionDenied => {
+                    Err("permission denied (need root or group)".to_string())
+                }
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                    Err("daemon not running or socket missing".to_string())
+                }
+                _ => Err(format!("daemon connection error: {err}")),
+            };
+        }
+    };
+
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+
+    let envelope = RequestEnvelope {
+        proto: sloth_proto::PROTO_VERSION,
+        request: req,
+    };
+
+    let payload = match serde_json::to_string(&envelope) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("serialization error: {e}")),
+    };
+
+    if let Err(e) = stream.write_all(format!("{payload}\n").as_bytes()) {
+        return Err(format!("failed to send request: {e}"));
+    }
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if let Err(e) = reader.read_line(&mut line) {
+        return Err(format!("failed to read response: {e}"));
+    }
+
+    let resp: Response<serde_json::Value> = match serde_json::from_str(&line) {
+        Ok(r) => r,
+        Err(_) => return Err("daemon returned invalid JSON".to_string()),
+    };
+
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "unknown daemon error".to_string()));
+    }
+
+    Ok(())
 }
 
 /// Strip control characters and sanitize strings for safe terminal rendering.
@@ -385,12 +513,37 @@ pub fn ui_render(f: &mut Frame, state: &mut AppState) {
         ActiveTab::Audit => render_audit_table(f, table_area, state),
     }
 
-    // 4. Footer line
-    let footer_text = " [q/Ctrl+C] Quit  [Tab] Switch View  [↑/↓] Select Row  [Enter] Full Reason ";
-    let footer_widget = Paragraph::new(Line::from(vec![Span::styled(
-        footer_text,
-        Style::default().fg(Color::Gray),
-    )]));
+    // 4. Footer line or feedback message
+    let footer_widget = if let Some((msg, ts)) = &state.feedback_message {
+        if ts.elapsed() < Duration::from_secs(3) {
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " >> ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    msg.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]))
+        } else {
+            let footer_text = " [q/Ctrl+C] Quit  [Tab] Switch  [↑/↓] Select  [Enter] Reason  [p] Permit  [b] Ban  [c] Clear ";
+            Paragraph::new(Line::from(vec![Span::styled(
+                footer_text,
+                Style::default().fg(Color::Gray),
+            )]))
+        }
+    } else {
+        let footer_text = " [q/Ctrl+C] Quit  [Tab] Switch  [↑/↓] Select  [Enter] Reason  [p] Permit  [b] Ban  [c] Clear ";
+        Paragraph::new(Line::from(vec![Span::styled(
+            footer_text,
+            Style::default().fg(Color::Gray),
+        )]))
+    };
     f.render_widget(footer_widget, chunks[3]);
 
     // Detail popup if Enter was pressed
@@ -427,7 +580,8 @@ fn render_cages_table(f: &mut Frame, area: Rect, state: &mut AppState) {
             .iter()
             .map(|c| {
                 let pid_str = c.pid.to_string();
-                let comm_str = truncate_ellipsis(&c.comm, 15);
+                let ind = state.override_indicator(&c.comm);
+                let comm_str = format!("{ind}{}", truncate_ellipsis(&c.comm, 15));
                 let quota_str = format!("{}%", c.quota_pct);
                 let throttled_str = format!("{}s", c.throttled_secs);
                 let ttl_str = format!("{}s", c.ttl_remaining_secs);
@@ -499,7 +653,8 @@ fn render_audit_table(f: &mut Frame, area: Rect, state: &mut AppState) {
             .iter()
             .map(|d| {
                 let pid_str = d.pid.to_string();
-                let comm_str = truncate_ellipsis(&d.comm, 15);
+                let ind = state.override_indicator(&d.comm);
+                let comm_str = format!("{ind}{}", truncate_ellipsis(&d.comm, 15));
                 let cpu_str = format!("{:.1}%", d.cpu_percent);
                 let action_style = match d.action.as_str() {
                     "Throttle" => Style::default().fg(Color::Red),
@@ -565,7 +720,7 @@ impl From<CellContent> for ratatui::widgets::Cell<'_> {
 }
 
 fn render_reason_popup(f: &mut Frame, area: Rect, reason: &str) {
-    let popup_width = area.width.saturating_sub(6).min(80).max(20);
+    let popup_width = area.width.saturating_sub(6).clamp(20, 80);
     let popup_height = 8.min(area.height.saturating_sub(2)).max(4);
 
     let x = (area.width.saturating_sub(popup_width)) / 2;
@@ -670,6 +825,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> io::
                         KeyCode::Down | KeyCode::Char('j') => state.next_row(),
                         KeyCode::Up | KeyCode::Char('k') => state.prev_row(),
                         KeyCode::Enter => state.show_selected_reason(),
+                        KeyCode::Char('p') if key.modifiers.is_empty() => {
+                            state.send_override(OverrideMode::Permit);
+                        }
+                        KeyCode::Char('b') if key.modifiers.is_empty() => {
+                            state.send_override(OverrideMode::Ban);
+                        }
+                        KeyCode::Char('c') if key.modifiers.is_empty() => {
+                            state.send_override(OverrideMode::Clear);
+                        }
                         _ => {}
                     }
                 }

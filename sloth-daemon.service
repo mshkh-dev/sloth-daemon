@@ -23,6 +23,13 @@ ExecStart=/usr/local/bin/sloth-daemon --config /etc/sloth-daemon/sloth.toml
 Restart=on-failure
 RestartSec=5s
 
+# RuntimeDirectory creates /run/sloth owned by root mode 0750.
+RuntimeDirectory=sloth
+RuntimeDirectoryMode=0750
+# StateDirectory creates /var/lib/sloth-daemon owned by root mode 0700.
+StateDirectory=sloth-daemon
+StateDirectoryMode=0700
+
 # Runs as root, but with a restricted capability set.
 #   CAP_BPF     - load eBPF programs and maps
 #   CAP_PERFMON - attach to the sched_switch and sched_process_exit tracepoints

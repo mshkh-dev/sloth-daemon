@@ -658,8 +658,15 @@ mod tests {
 
         // Samples 1 through 4: cool-down in progress, must NOT release yet
         for i in 1..=4 {
-            let (action, reason) =
-                decide_with_reason(&calm_sample, None, &verdict_runaway(), &state, &config, now, &OverrideStore::default());
+            let (action, reason) = decide_with_reason(
+                &calm_sample,
+                None,
+                &verdict_runaway(),
+                &state,
+                &config,
+                now,
+                &OverrideStore::default(),
+            );
             assert_eq!(
                 action,
                 ThrottleAction::None,
@@ -671,8 +678,15 @@ mod tests {
         }
 
         // Sample 5: completes cool_down_samples (5) -> triggers Release!
-        let (action, reason) =
-            decide_with_reason(&calm_sample, None, &verdict_runaway(), &state, &config, now, &OverrideStore::default());
+        let (action, reason) = decide_with_reason(
+            &calm_sample,
+            None,
+            &verdict_runaway(),
+            &state,
+            &config,
+            now,
+            &OverrideStore::default(),
+        );
         assert_eq!(
             action,
             ThrottleAction::Release { pid: 999 },
@@ -767,8 +781,15 @@ mod tests {
             window_secs: 2,
         };
 
-        let (action, reason) =
-            decide_with_reason(&sample, None, &verdict_runaway(), &state, &config, now, &OverrideStore::default());
+        let (action, reason) = decide_with_reason(
+            &sample,
+            None,
+            &verdict_runaway(),
+            &state,
+            &config,
+            now,
+            &OverrideStore::default(),
+        );
         assert_eq!(action, ThrottleAction::Release { pid: 999 });
         assert_eq!(reason, "process became protected");
     }
@@ -788,5 +809,112 @@ mod tests {
         assert_eq!(exited[0].0, 1002);
         assert!(!state.is_throttled(1002));
         assert!(state.is_throttled(1001));
+    }
+
+    #[test]
+    fn test_permit_beats_ban_and_short_circuits() {
+        let config = test_config();
+        let now = Instant::now();
+        let sample = sample_hot(); // comm: "stress-ng"
+        let verdict = verdict_runaway();
+
+        let mut store = OverrideStore::default();
+        store.permits.insert("stress-ng".to_string());
+        store.bans.insert("stress-ng".to_string()); // permit beats ban
+
+        let (action, reason) = decide_with_reason(
+            &sample,
+            None,
+            &verdict,
+            &PolicyState::new(),
+            &config,
+            now,
+            &store,
+        );
+
+        assert_eq!(action, ThrottleAction::None);
+        assert_eq!(reason, "permitted by user");
+    }
+
+    #[test]
+    fn test_banned_sustained_throttles() {
+        let config = test_config();
+        let now = Instant::now();
+
+        // Sample for a program not normally classified as runaway
+        let sample = ProcessSample {
+            pid: 54321,
+            comm: "unusual_worker".to_string(),
+            cpu_percent: 95.0,
+            sustained_secs: 45, // >= sustained_secs threshold (30)
+            window_secs: 2,
+        };
+
+        // Verdict recommends throttle with high confidence but Essential class
+        let verdict = Verdict {
+            classification: Class::Essential,
+            confidence: 0.95,
+            throttle_recommended: true,
+            reason: "heavy workload".to_string(),
+        };
+
+        let mut store = OverrideStore::default();
+        store.bans.insert("unusual_worker".to_string());
+
+        let (action, reason) = decide_with_reason(
+            &sample,
+            None,
+            &verdict,
+            &PolicyState::new(),
+            &config,
+            now,
+            &store,
+        );
+
+        assert_eq!(
+            action,
+            ThrottleAction::Throttle {
+                pid: 54321,
+                quota_pct: 20
+            }
+        );
+        assert!(reason.contains("justifies throttle"));
+    }
+
+    #[test]
+    fn test_banned_not_sustained_no_action() {
+        let config = test_config();
+        let now = Instant::now();
+
+        let sample = ProcessSample {
+            pid: 54321,
+            comm: "unusual_worker".to_string(),
+            cpu_percent: 95.0,
+            sustained_secs: 10, // < 30s
+            window_secs: 2,
+        };
+
+        let verdict = Verdict {
+            classification: Class::Essential,
+            confidence: 0.95,
+            throttle_recommended: true,
+            reason: "heavy workload".to_string(),
+        };
+
+        let mut store = OverrideStore::default();
+        store.bans.insert("unusual_worker".to_string());
+
+        let (action, reason) = decide_with_reason(
+            &sample,
+            None,
+            &verdict,
+            &PolicyState::new(),
+            &config,
+            now,
+            &store,
+        );
+
+        assert_eq!(action, ThrottleAction::None);
+        assert_eq!(reason, "cpu not sustained long enough");
     }
 }

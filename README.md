@@ -259,6 +259,33 @@ sloth-daemon/
 | `cargo` fails under sudo | Root has no default toolchain. Build as your normal user, then run only the binary or scripts with sudo. |
 | Leftover `sloth-daemon` cgroups | Restart the daemon. It cleans up leftovers on startup. |
 
+## Runtime Overrides (v2 Phase 9)
+
+Runtime overrides allow steering the daemon's policy dynamically from `sloth-ui` or via the local Unix socket without editing `sloth.toml` or restarting:
+- **`permit`**: Never throttle this program name (`comm`). Short-circuits to no action; beats ban.
+- **`ban`**: Treats the program as a throttle candidate. All other safety gate checks (sustained CPU, confidence threshold, cap, and quota floor) still strictly apply.
+- **`clear`**: Removes an existing override for the program name.
+
+Protected system processes (such as `systemd`, `sshd`, and GUI compositors) cannot be overridden by permit or ban.
+
+### Controls in `sloth-ui`
+Select a row in either **Active Cages** or **Audit Stream** and press:
+- `p`: Permit selected process name (never throttle, marked `[P]`)
+- `b`: Ban selected process name (treat as throttle candidate, marked `[B]`)
+- `c`: Clear override on selected process name
+
+Overrides persist across daemon restarts in `/var/lib/sloth-daemon/overrides.toml` (0600 root) using temp-file atomic rename.
+
+### Manual Socket Control
+Mutating requests require root (or membership in the configured socket group):
+```bash
+# Ban 'yes' using socat
+echo '{"proto":1,"cmd":"override","name":"yes","mode":"ban"}' | sudo socat - UNIX-CONNECT:/run/sloth/sloth.sock
+
+# List overrides
+echo '{"proto":1,"cmd":"overrides"}' | socat - UNIX-CONNECT:/run/sloth/sloth.sock
+```
+
 ## Contributing
 
 Development follows the phased plan in `blueprint.md` and the rules in `instructions.md`. If you use a coding agent, point it at those two files first.

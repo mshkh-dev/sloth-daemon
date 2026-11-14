@@ -73,8 +73,8 @@ struct OverridesFile {
 /// All I/O is done outside the lock; only the swap is done under the lock.
 #[derive(Debug, Clone, Default)]
 pub struct OverrideStore {
-    permits: std::collections::HashSet<String>,
-    bans: std::collections::HashSet<String>,
+    pub permits: std::collections::HashSet<String>,
+    pub bans: std::collections::HashSet<String>,
 }
 
 impl OverrideStore {
@@ -91,6 +91,11 @@ impl OverrideStore {
     /// Total number of override entries.
     pub fn len(&self) -> usize {
         self.permits.len() + self.bans.len()
+    }
+
+    /// Returns `true` if no overrides are stored.
+    pub fn is_empty(&self) -> bool {
+        self.permits.is_empty() && self.bans.is_empty()
     }
 
     /// Snapshot of all current overrides as a vec.
@@ -685,7 +690,8 @@ async fn handle_connection(
             // rather than hard-coding uid==0.
             if !authorizer(peer_uid, peer_gid) {
                 warn!(peer_uid, name = %name, "Override request rejected: peer not authorized");
-                let resp: Response<()> = Response::err("override requires root or configured group");
+                let resp: Response<()> =
+                    Response::err("override requires root or configured group");
                 serde_json::to_string(&resp)
             } else {
                 handle_override_request(state, name, mode).await
@@ -720,19 +726,24 @@ async fn handle_override_request(
 
     // 2. Protected names are rejected for both permit and ban before any other check.
     //    Use the combined protected_names list from IpcState (BUILTIN + extra + never_throttle).
+    //    Always ensure BUILTIN_PROTECTED_NAMES are checked even if protected_names was not initialized.
     let (all_protected, overrides_path, current_overrides) = {
         let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut protected = guard.protected_names.clone();
+        for &builtin in crate::cgroup_manager::BUILTIN_PROTECTED_NAMES {
+            if !protected.iter().any(|p| p == builtin) {
+                protected.push(builtin.to_string());
+            }
+        }
         (
-            guard.protected_names.clone(),
+            protected,
             guard.overrides_path.clone(),
             guard.overrides.clone(),
         )
     };
     if matches_protected_name(&name, &all_protected) {
         warn!(name = %name, "Override rejected: name is in the protected list");
-        return serde_json::to_string(&Response::<()>::err(
-            "protected names cannot be overridden",
-        ));
+        return serde_json::to_string(&Response::<()>::err("protected names cannot be overridden"));
     }
 
     // 3. Apply the requested change to the snapshot.
@@ -773,7 +784,9 @@ async fn handle_override_request(
     }
 
     info!(name = %name, mode = ?mode, "Override applied");
-    serde_json::to_string(&Response::ok(format!("override applied: {name} = {mode:?}")))
+    serde_json::to_string(&Response::ok(format!(
+        "override applied: {name} = {mode:?}"
+    )))
 }
 
 #[cfg(test)]
@@ -788,6 +801,14 @@ mod tests {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
         std::env::temp_dir().join(format!("sloth_ipc_test_{pid}_{id}.sock"))
+    }
+
+    fn get_test_dir() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let p = std::env::temp_dir().join(format!("sloth_ipc_dir_{pid}_{id}"));
+        let _ = fs::create_dir_all(&p);
+        p
     }
 
     #[test]
@@ -990,5 +1011,175 @@ mod tests {
 
         handle.abort();
         let _ = fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn test_name_validation_rules() {
+        // Valid names
+        assert!(validate_name("yes").is_ok());
+        assert!(validate_name("my-proc_1.0+bin").is_ok());
+        assert!(validate_name(&"a".repeat(64)).is_ok());
+
+        // Invalid names: empty, too long, forbidden characters
+        assert!(validate_name("").is_err());
+        assert!(validate_name(&"a".repeat(65)).is_err());
+        assert!(validate_name("foo bar").is_err());
+        assert!(validate_name("proc/name").is_err());
+        assert!(validate_name("proc\0name").is_err());
+        assert!(validate_name("proc$name").is_err());
+    }
+
+    #[test]
+    fn test_atomic_write_and_reload() {
+        let dir = get_test_dir();
+        let file_path = dir.join("overrides.toml");
+
+        let mut store = OverrideStore::default();
+        store.permits.insert("custom_app".to_string());
+        store.bans.insert("stress-ng".to_string());
+
+        persist_overrides(&store, &file_path).expect("persist succeeds");
+        assert!(file_path.exists());
+
+        let loaded = load_overrides(&file_path);
+        assert!(loaded.is_permitted("custom_app"));
+        assert!(loaded.is_banned("stress-ng"));
+        assert_eq!(loaded.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_failure_leaves_memory_unchanged() {
+        let bad_path = Path::new("/proc/sys/fs/sloth_nonexistent_read_only/overrides.toml");
+        let store = OverrideStore::default();
+        let res = persist_overrides(&store, bad_path);
+        assert!(res.is_err(), "Persist to read-only/illegal path must fail");
+    }
+
+    #[test]
+    fn test_malformed_file_copied_to_bad_and_ignored() {
+        let dir = get_test_dir();
+        let file_path = dir.join("overrides.toml");
+
+        fs::write(&file_path, b"not valid toml ::: [[[ broken").unwrap();
+        let loaded = load_overrides(&file_path);
+        assert_eq!(loaded.len(), 0, "Malformed file must yield empty store");
+
+        let bad_path = dir.join("overrides.toml.bad");
+        assert!(bad_path.exists(), "Malformed file must be copied to .bad");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_override_protected_names_rejected_in_ipc() {
+        let sock_path = get_test_socket_path();
+        let _ = fs::remove_file(&sock_path);
+
+        let config = IpcConfig {
+            socket_path: sock_path.clone(),
+            ..Default::default()
+        };
+
+        let my_uid = current_euid();
+        let authorizer: AuthFn = Arc::new(move |peer_uid, _| peer_uid == my_uid);
+
+        let (handle, state) = start_ipc_server(&config, true, "0.1.0-test", "rules", 5, authorizer)
+            .expect("server starts")
+            .unwrap();
+
+        // Populate protected names
+        {
+            let mut guard = state.lock().unwrap();
+            guard.set_protected_names(vec!["systemd".to_string(), "sshd".to_string()]);
+        }
+
+        let mut client = UnixStream::connect(&sock_path).await.expect("connect");
+        // Attempt to ban protected process systemd
+        client
+            .write_all(
+                b"{\"proto\":1,\"cmd\":\"override\",\"name\":\"systemd\",\"mode\":\"ban\"}\n",
+            )
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut response_line = String::new();
+        reader.read_line(&mut response_line).await.unwrap();
+
+        let resp: Response<()> = serde_json::from_str(&response_line).unwrap();
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("protected"));
+
+        handle.abort();
+        let _ = fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn test_startup_wiring_override_roundtrip() {
+        let sock_path = get_test_socket_path();
+        let _ = fs::remove_file(&sock_path);
+        let dir = get_test_dir();
+        let overrides_file = dir.join("overrides.toml");
+
+        let config = IpcConfig {
+            socket_path: sock_path.clone(),
+            overrides_path: overrides_file.clone(),
+            ..Default::default()
+        };
+
+        let my_uid = current_euid();
+        let authorizer: AuthFn = Arc::new(move |peer_uid, _| peer_uid == my_uid);
+
+        let (handle, _state) =
+            start_ipc_server(&config, true, "0.1.0-test", "rules", 5, authorizer)
+                .expect("server starts")
+                .unwrap();
+
+        let mut client = UnixStream::connect(&sock_path).await.expect("connect");
+        client
+            .write_all(b"{\"proto\":1,\"cmd\":\"override\",\"name\":\"yes\",\"mode\":\"ban\"}\n")
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(client);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).await.unwrap();
+        let resp: Response<String> = serde_json::from_str(&resp_line).unwrap();
+        assert!(resp.ok);
+
+        // Verify with overrides list command
+        let mut client2 = UnixStream::connect(&sock_path).await.expect("connect");
+        client2
+            .write_all(b"{\"proto\":1,\"cmd\":\"overrides\"}\n")
+            .await
+            .unwrap();
+
+        let mut reader2 = BufReader::new(client2);
+        let mut resp_line2 = String::new();
+        reader2.read_line(&mut resp_line2).await.unwrap();
+        let list_resp: Response<Vec<OverrideEntry>> = serde_json::from_str(&resp_line2).unwrap();
+        assert!(list_resp.ok);
+        let entries = list_resp.data.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "yes");
+        assert_eq!(entries[0].mode, OverrideMode::Ban);
+
+        // Verify unknown command returns error
+        let mut client3 = UnixStream::connect(&sock_path).await.expect("connect");
+        client3
+            .write_all(b"{\"proto\":1,\"cmd\":\"unknown_frobnicate\"}\n")
+            .await
+            .unwrap();
+
+        let mut reader3 = BufReader::new(client3);
+        let mut resp_line3 = String::new();
+        reader3.read_line(&mut resp_line3).await.unwrap();
+        let unk_resp: Response<()> = serde_json::from_str(&resp_line3).unwrap();
+        assert!(!unk_resp.ok);
+        assert_eq!(unk_resp.error.unwrap(), "unknown command");
+
+        handle.abort();
+        let _ = fs::remove_file(&sock_path);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
