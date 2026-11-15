@@ -318,7 +318,7 @@ sudo systemctl enable --now sloth-daemon.service
 | `cargo` fails under sudo | Root has no default toolchain. Build as your normal user, then run only the binary or scripts with sudo. |
 | Leftover `sloth-daemon` cgroups | Restart the daemon. It cleans up leftovers on startup. |
 
-## Runtime Overrides and Control Socket (v2 Phase 9)
+## Runtime Overrides and Control Socket
 
 Sloth Daemon provides a local Unix domain control socket at `/run/sloth/sloth.sock`. The directory is created with mode `0750` and the socket with mode `0600`, both owned by `root` (created by systemd via `RuntimeDirectory=sloth` when run as a service), so tools like `sloth-ui` require `sudo` unless an authorized group is configured. The daemon continues running normally without the socket if it cannot be created or if `[ipc] enabled = false`.
 
