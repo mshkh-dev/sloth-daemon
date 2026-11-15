@@ -287,7 +287,7 @@ Complete phases **in order**. Do not start a phase until the previous phase's ch
 - **Exit check:** `makepkg -f` succeeds in `packaging/aur/` against the local tarball. `namcap` on the PKGBUILD and the built package is clean, or every remaining warning is explained in one line. `pacman -Qlp *.pkg.tar.zst` lists only paths under `/usr` and `/etc`, with the unit using `/usr/bin`. The user installs it, runs `sloth-daemon --check`, starts the service, and `./scripts/service-check.sh` equivalent checks pass against the packaged paths.
 - **Out of scope:** pushing to the AUR, creating tags, CI, other distributions, signing.
 
-### Phase 11: Learned Evidence and Profile Manager (deferred)
+### Phase 11: Learned Evidence and Profile Manager (future)
 
 - **Goal:** Reduce override friction by remembering what the user has permitted or banned, and show it in the UI, without giving the daemon any new power to act on its own.
 - **Why it fits:** It stays local and transparent. v2 already shows *why* the daemon acted and lets the user steer it. Phase 11 lets the daemon remember the user's choices, so the same program is not asked about twice.
@@ -342,27 +342,27 @@ The project is done when **every** box below is true and has been verified by ru
 - [x] No code path kills, stops, or re-prioritises a process by any other means.
 
 ### IPC and Safety
-- [ ] The socket directory and file are not world-accessible, and an unauthorised peer is refused.
-- [ ] Oversized or malformed requests are rejected without crashing or blocking the control loop.
-- [ ] The socket file is removed on SIGINT/SIGTERM, and a stale one is replaced on start.
-- [ ] If IPC fails to start, the daemon still runs as in v1.
-- [ ] No request can throttle, release or signal a PID. Only policy lists change.
-- [ ] `cargo tree -p sloth-daemon` shows no `ratatui` or `crossterm`.
+- [x] The socket directory and file are not world-accessible, and an unauthorised peer is refused.
+- [x] Oversized or malformed requests are rejected without crashing or blocking the control loop.
+- [x] The socket file is removed on SIGINT/SIGTERM, and a stale one is replaced on start.
+- [x] If IPC fails to start, the daemon still runs as in v1.
+- [x] No request can throttle, release or signal a PID. Only policy lists change.
+- [x] `cargo tree -p sloth-daemon` shows no `ratatui` or `crossterm`.
 
 ### UI and Overrides
-- [ ] `sloth-ui` shows active cages and the audit stream from a live daemon, and handles the daemon going away.
-- [ ] The terminal is always restored on exit.
-- [ ] Permit and ban work, survive a restart, and never override the protected list or the policy gate.
+- [x] `sloth-ui` shows active cages and the audit stream from a live daemon, and handles the daemon going away.
+- [x] The terminal is always restored on exit.
+- [x] Permit and ban work, survive a restart, and never override the protected list or the policy gate.
 
 ### Arch Linux Packaging
-- [ ] Versions are 0.2.0 everywhere, `Cargo.lock` is committed, `target/` is untracked.
-- [ ] `makepkg` builds the package with no network access in `build()`.
-- [ ] `namcap` is clean or explained.
-- [ ] The package installs only under `/usr` and `/etc`, the config is in `backup=()`, and the service is not enabled by the package.
-- [ ] A fresh install on the user's machine starts and passes a dry-run check.
-- [ ] README has the Arch install section and the "Why not X?" comparison.
+- [x] Versions are 0.2.0 everywhere, `Cargo.lock` is committed, `target/` is untracked.
+- [x] `makepkg` builds the package with no network access in `build()`.
+- [x] `namcap` is clean or explained.
+- [x] The package installs only under `/usr` and `/etc`, the config is in `backup=()`, and the service is not enabled by the package.
+- [x] A fresh install on the user's machine starts and passes a dry-run check.
+- [x] README has the Arch install section and the "Why not alternatives?" comparison.
 
-### Learned Evidence & Profile Manager
+### Learned Evidence & Profile Manager(future)
 - [ ] Learned data only adds a derived feature to the brief. The gate and the protected list are unchanged, and tests prove it.
 - [ ] Profiles are bounded, validated, atomically written and survive restart.
 - [ ] A malformed profiles file does not stop the daemon.
@@ -374,4 +374,4 @@ The project is done when **every** box below is true and has been verified by ru
 - [x] `README.md` explains installation, privileges, dry-run, and configuration.
 - [x] A systemd unit example is included.
 - [x] Every decision the daemon makes is explained in its logs.### Feature 1: Interactive TUI / Control Center (The Best "UX" Upgrade)
-- [ ] README documents the socket path, permissions, `sloth-ui`, overrides and the new config keys.
+- [x] README documents the socket path, permissions, `sloth-ui`, overrides and the new config keys.

@@ -152,6 +152,13 @@ throttle_candidates = []       # rules mode: names it may throttle. Empty = noth
 
 [protected]
 extra_names = []               # added to the built-in protected list
+
+[ipc]
+enabled = true                 # enable or disable IPC control socket
+socket_path = "/run/sloth/sloth.sock" # path to Unix domain socket
+history = 256                  # ring buffer capacity for policy decisions
+group = ""                     # optional Unix group allowed socket access (default none)
+overrides_path = "/var/lib/sloth-daemon/overrides.toml" # overrides persistence file
 ```
 
 **Built-in always-protected names:** `systemd`, `systemd-*`, `sshd`, `dbus-daemon`, `Xorg`, `Xwayland`, `gnome-shell`, `kwin_*`, `pipewire`, `pulseaudio`, `NetworkManager`, `ollama`.
@@ -217,30 +224,52 @@ Capabilities set in the unit: `CAP_BPF` and `CAP_PERFMON`, for loading eBPF and 
 
 ```
 sloth-daemon/
-├── README.md                 # This file
 ├── blueprint.md              # Architecture, phases, Definition of Done
+├── Cargo.lock                # Cargo dependency lockfile
+├── Cargo.toml                # Workspace manifest (sloth-daemon, sloth-ebpf, sloth-proto, sloth-ui)
 ├── instructions.md           # Operating rules for the coding agent
-├── sloth-daemon.service      # Systemd unit example
-├── sloth.toml                # Example configuration
-├── scripts/
-│   ├── e2e-phase5.sh         # End-to-end throttle test (needs sudo)
+├── LICENSE                   # Project license file
+├── packaging/
+│   └── aur/
+│       ├── PKGBUILD          # Arch User Repository package build script
+│       └── sloth-daemon.install # AUR installation script/hooks
+├── README.md                 # Project overview and documentation
+├── rust-toolchain.toml       # Pinned Rust toolchain configuration
+├── scripts/                  # Automation, validation, and test scripts
 │   ├── crash-recovery.sh     # Crash-recovery integration test (root required)
-│   └── llm-check.sh          # Live Ollama check, dry run only (needs sudo and Ollama)
-├── .agents/skills/           # Skill files used by the coding agent
-│   ├── ebpf-probe-builder.md
-│   ├── cgroup-enforcer.md
-│   └── ollama-bridge.md
-├── Cargo.toml                # Workspace: sloth-ebpf + sloth-daemon
+│   ├── e2e-phase5.sh         # End-to-end throttle test (needs sudo)
+│   ├── edge-check.sh         # Edge case checking script
+│   ├── ipc-check.sh          # IPC communication verification script
+│   ├── llm-check.sh          # Live Ollama check, dry run only (needs sudo and Ollama)
+│   ├── overrides_check.sh    # Policy override validation script
+│   ├── pkg-check.sh          # Packaging verification script
+│   └── service-check.sh      # Systemd service validation check
+├── sloth-daemon/             # User-space daemon crate
+│   ├── build.rs              # Daemon build script
+│   ├── Cargo.toml            # Crate manifest
+│   └── src/
+│       ├── ai_classifier.rs  # Ollama bridge (optional; rules mode needs no Ollama)
+│       ├── broker.rs         # Evidence broker: ProcessBrief, metric history, rules
+│       ├── cgroup_manager.rs # cgroup v2 enforcement
+│       ├── ipc.rs            # Inter-process communication handler
+│       ├── main.rs           # Config, sampling, control loop, signals
+│       └── policy.rs         # Deterministic policy gate
+├── sloth-daemon.service      # Systemd unit example file
 ├── sloth-ebpf/               # Kernel-space eBPF program (aya-ebpf)
-│   └── src/main.rs
-└── sloth-daemon/             # User-space daemon
+│   ├── Cargo.toml            # Crate manifest
+│   └── src/
+│       └── main.rs           # eBPF kernel program entrypoint
+├── sloth-proto/              # Shared protocol and message definitions crate
+│   ├── Cargo.toml            # Crate manifest
+│   └── src/
+│       └── lib.rs            # Protobuf / IPC schema and type definitions
+├── sloth.toml                # Example runtime configuration file
+└── sloth-ui/                 # User interface frontend crate
+    ├── Cargo.toml            # Crate manifest
     └── src/
-        ├── main.rs           # Config, sampling, control loop, signals
-        ├── broker.rs         # Evidence broker: ProcessBrief, metric history, rules
-        ├── policy.rs         # Deterministic policy gate
-        ├── ai_classifier.rs  # Ollama bridge (optional; rules mode needs no Ollama)
-        └── cgroup_manager.rs # cgroup v2 enforcement
+        └── main.rs           # UI entrypoint
 ```
+
 
 ## Documentation
 
@@ -250,7 +279,7 @@ sloth-daemon/
 
 ### Arch Linux (AUR)
 
-Sloth-daemon is packaged for Arch Linux under `packaging/aur/`:
+An AUR package is planned and not published yet; manual build from `packaging/aur/` works today:
 
 ```bash
 cd packaging/aur
@@ -267,13 +296,13 @@ sudo systemctl enable --now sloth-daemon.service
 
 ---
 
-## Why Not X?
+## Why Not Existing Alternatives?
 
 | Tool | Approach | Comparison to Sloth |
-|:--|:--|:--|
-| **systemd slices** | Static allocations (`MemoryMax`, `CPUWeight`) configured per service or user session. | systemd limits whole cgroups statically. Sloth observes dynamic runaway behavior of individual processes across sessions and applies time-bounded throttle cages. |
-| **earlyoom / systemd-oomd** | SIGTERM/SIGKILL when memory or swap pressure exceeds threshold. | earlyoom and systemd-oomd terminate processes when RAM/swap is exhausted. Sloth throttles CPU via CFS bandwidth quotas and never kills or signals processes. |
-| **ananicy / ananicy-cpp** | Adjusts `nice` priority and `ionice` based on predefined community rules. | Ananicy changes static nice/sched priority. A nice 19 process can still consume 100% CPU when cores are idle. Sloth caps maximum core usage via cgroup v2 `cpu.max`. |
+| :--- | :--- | :--- |
+| **systemd slices** / `systemd-run` | Static allocations (`MemoryMax`, `CPUWeight`) or transient cgroup quotas configured per service or user session. | systemd limits whole cgroups statically. Sloth observes dynamic runaway behavior of individual processes across sessions and applies time-bounded throttle cages. |
+| **earlyoom / systemd-oomd** | Triggers `SIGTERM` or `SIGKILL` when memory or swap pressure exceeds critical thresholds. | earlyoom and systemd-oomd terminate processes when RAM/swap is exhausted. Sloth throttles CPU dynamically via CFS bandwidth quotas (`cpu.max`) and never kills or signals processes. |
+| **ananicy / ananicy-cpp** | Adjusts `nice` priority and `ionice` based on predefined community rules. | Ananicy changes static nice/sched priority. A nice 19 process can still consume 100% CPU when cores are idle. Sloth caps maximum core usage via cgroup v2. |
 | **cpulimit** | Userspace tool that sends alternating `SIGSTOP` and `SIGCONT` signals to a target PID. | `cpulimit` induces stutter, pauses interactive apps abruptly, and requires manual PID attachment. Sloth automatically detects workloads using kernel tracepoints and controls them smoothly with hardware cgroup v2 quotas. |
 
 ---
@@ -289,9 +318,13 @@ sudo systemctl enable --now sloth-daemon.service
 | `cargo` fails under sudo | Root has no default toolchain. Build as your normal user, then run only the binary or scripts with sudo. |
 | Leftover `sloth-daemon` cgroups | Restart the daemon. It cleans up leftovers on startup. |
 
-## Runtime Overrides (v2 Phase 9)
+## Runtime Overrides and Control Socket (v2 Phase 9)
 
-Runtime overrides allow steering the daemon's policy dynamically from `sloth-ui` or via the local Unix socket without editing `sloth.toml` or restarting:
+Sloth Daemon provides a local Unix domain control socket at `/run/sloth/sloth.sock`. The directory is created with mode `0750` and the socket with mode `0600`, both owned by `root` (created by systemd via `RuntimeDirectory=sloth` when run as a service), so tools like `sloth-ui` require `sudo` unless an authorized group is configured. The daemon continues running normally without the socket if it cannot be created or if `[ipc] enabled = false`.
+
+By design, the control socket can only change policy lists (`permit`, `ban`, `clear`); it can never throttle, release, signal, or directly act on a PID.
+
+Runtime overrides allow steering the daemon's policy dynamically from `sloth-ui` or via the socket without editing `sloth.toml` or restarting:
 - **`permit`**: Never throttle this program name (`comm`). Short-circuits to no action; beats ban.
 - **`ban`**: Treats the program as a throttle candidate. All other safety gate checks (sustained CPU, confidence threshold, cap, and quota floor) still strictly apply.
 - **`clear`**: Removes an existing override for the program name.
@@ -307,12 +340,15 @@ Select a row in either **Active Cages** or **Audit Stream** and press:
 Overrides persist across daemon restarts in `/var/lib/sloth-daemon/overrides.toml` (0600 root) using temp-file atomic rename.
 
 ### Manual Socket Control
-Mutating requests require root (or membership in the configured socket group):
+Mutating requests require root (or membership in the configured socket group). `socat` is optional and `python3` works too:
 ```bash
+# Query status with python3
+python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('/run/sloth/sloth.sock'); s.sendall(b'{\"proto\":1,\"cmd\":\"status\"}\n'); print(s.recv(4096).decode())"
+
 # Ban 'yes' using socat
 echo '{"proto":1,"cmd":"override","name":"yes","mode":"ban"}' | sudo socat - UNIX-CONNECT:/run/sloth/sloth.sock
 
-# List overrides
+# List overrides using socat
 echo '{"proto":1,"cmd":"overrides"}' | socat - UNIX-CONNECT:/run/sloth/sloth.sock
 ```
 
