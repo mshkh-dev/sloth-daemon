@@ -1,0 +1,101 @@
+# Maintainer: mshkh-dev <contact@mshkh.is-a.dev>
+pkgname=sloth-daemon
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="AI-supervised background process throttle daemon for Linux using eBPF and cgroup v2"
+arch=('x86_64')
+url="https://github.com/mshkh-dev/sloth-daemon"
+license=('AGPL-3.0-only')
+depends=('gcc-libs')
+optdepends=('ollama: optional local LLM classification mode')
+makedepends=('rustup' 'bpf-linker')
+backup=('etc/sloth-daemon/sloth.toml')
+options=('!debug')
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/mshkh-dev/sloth-daemon/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('e935c566e85e396cda27ecb64959f1561209a70aa026d25ee3c0ca1713f6db76')
+
+_nightly_toolchain="nightly-2026-10-23"
+
+prepare() {
+    cd "${pkgname}-${pkgver}"
+
+    export RUSTUP_HOME="${srcdir}/rustup"
+    export CARGO_HOME="${srcdir}/cargo"
+
+    echo "==> Setting up isolated rustup toolchain ${_nightly_toolchain} with rust-src..."
+    rustup toolchain install "${_nightly_toolchain}" --profile minimal --component rust-src
+    rustup default "${_nightly_toolchain}"
+
+    echo "==> Fetching locked workspace dependencies..."
+    cargo fetch --locked
+
+    echo "==> Fetching locked sysroot build-std dependencies..."
+    local _sysroot
+    _sysroot="$(rustc --print sysroot)"
+    cargo fetch --manifest-path "${_sysroot}/lib/rustlib/src/rust/library/sysroot/Cargo.toml" --locked
+}
+
+build() {
+    cd "${pkgname}-${pkgver}"
+
+    export RUSTUP_HOME="${srcdir}/rustup"
+    export CARGO_HOME="${srcdir}/cargo"
+    export PATH="${RUSTUP_HOME}/toolchains/${_nightly_toolchain}-x86_64-unknown-linux-gnu/bin:${PATH}"
+
+    echo "==> Building eBPF bytecode in release mode..."
+    cargo build --frozen --package sloth-ebpf --target bpfel-unknown-none -Z build-std=core --release
+
+    local _ebpf_bin="target/bpfel-unknown-none/release/sloth-ebpf"
+    if [ ! -f "${_ebpf_bin}" ]; then
+        echo "ERROR: eBPF binary not found at ${_ebpf_bin}" >&2
+        return 1
+    fi
+
+    echo "==> Building userspace binaries (sloth-daemon, sloth-ui)..."
+    export SLOTH_EBPF_PATH="$(pwd)/${_ebpf_bin}"
+    export SLOTH_REQUIRE_EBPF=1
+    cargo build --frozen --package sloth-daemon --package sloth-ui --release
+}
+
+check() {
+    cd "${pkgname}-${pkgver}"
+
+    local _ebpf_bin="target/bpfel-unknown-none/release/sloth-ebpf"
+    if [ ! -f "${_ebpf_bin}" ]; then
+        echo "check() failed: eBPF binary missing" >&2
+        return 1
+    fi
+
+    # Fail if the binary is the placeholder or not ELF
+    local _magic
+    _magic="$(head -c 4 "${_ebpf_bin}")"
+    if [ "${_magic}" != $'\x7fELF' ]; then
+        echo "check() failed: eBPF binary is not a valid ELF object (placeholder detected)" >&2
+        return 1
+    fi
+
+    echo "check() passed: eBPF binary is valid ELF object."
+}
+
+package() {
+    cd "${pkgname}-${pkgver}"
+
+    # Binaries
+    install -Dm755 target/release/sloth-daemon "${pkgdir}/usr/bin/sloth-daemon"
+    install -Dm755 target/release/sloth-ui "${pkgdir}/usr/bin/sloth-ui"
+
+    # Configuration
+    install -Dm644 sloth.toml "${pkgdir}/etc/sloth-daemon/sloth.toml"
+
+    # Systemd service with ExecStart pointing to /usr/bin/sloth-daemon
+    # Strip manual install header instructions
+    sed -e '/^# Install:/,/^# \+sudo systemctl enable/d' \
+        -e 's|/usr/local/bin/sloth-daemon|/usr/bin/sloth-daemon|g' \
+        sloth-daemon.service \
+        | install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/system/sloth-daemon.service"
+
+    # Documentation and licenses
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

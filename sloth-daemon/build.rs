@@ -42,6 +42,10 @@ fn main() {
         }
     }
 
+    if env::var("SLOTH_REQUIRE_EBPF").as_deref() == Ok("1") && !found {
+        panic!("SLOTH_REQUIRE_EBPF=1 is set, but no valid ELF eBPF object was found at candidate locations");
+    }
+
     if !found {
         fs::write(&dest_path, EBPF_PLACEHOLDER_MAGIC).expect("failed to write eBPF placeholder");
     }

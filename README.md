@@ -74,7 +74,7 @@ ls /sys/kernel/btf/vmlinux        # expect: the file exists
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/Moeen-19/sloth-daemon.git
+   git clone https://github.com/mshkh-dev/sloth-daemon.git
    cd sloth-daemon
    ```
 
@@ -248,6 +248,36 @@ sloth-daemon/
 - Agent operating rules: `instructions.md`
 - Agent skills: `.agents/skills/`
 
+### Arch Linux (AUR)
+
+Sloth-daemon is packaged for Arch Linux under `packaging/aur/`:
+
+```bash
+cd packaging/aur
+makepkg -si
+```
+
+The package installs `sloth-daemon` and `sloth-ui` into `/usr/bin/`, the default config to `/etc/sloth-daemon/sloth.toml`, and the systemd unit to `/usr/lib/systemd/system/sloth-daemon.service`. The service is not enabled automatically.
+
+Verify your environment before enabling the service:
+```bash
+sudo sloth-daemon --check
+sudo systemctl enable --now sloth-daemon.service
+```
+
+---
+
+## Why Not X?
+
+| Tool | Approach | Comparison to Sloth |
+|:--|:--|:--|
+| **systemd slices** | Static allocations (`MemoryMax`, `CPUWeight`) configured per service or user session. | systemd limits whole cgroups statically. Sloth observes dynamic runaway behavior of individual processes across sessions and applies time-bounded throttle cages. |
+| **earlyoom / systemd-oomd** | SIGTERM/SIGKILL when memory or swap pressure exceeds threshold. | earlyoom and systemd-oomd terminate processes when RAM/swap is exhausted. Sloth throttles CPU via CFS bandwidth quotas and never kills or signals processes. |
+| **ananicy / ananicy-cpp** | Adjusts `nice` priority and `ionice` based on predefined community rules. | Ananicy changes static nice/sched priority. A nice 19 process can still consume 100% CPU when cores are idle. Sloth caps maximum core usage via cgroup v2 `cpu.max`. |
+| **cpulimit** | Userspace tool that sends alternating `SIGSTOP` and `SIGCONT` signals to a target PID. | `cpulimit` induces stutter, pauses interactive apps abruptly, and requires manual PID attachment. Sloth automatically detects workloads using kernel tracepoints and controls them smoothly with hardware cgroup v2 quotas. |
+
+---
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -292,4 +322,4 @@ Development follows the phased plan in `blueprint.md` and the rules in `instruct
 
 ## License
 
-Distributed under the AGPL-3.0 License. See [`LICENSE`](LICENSE).
+Distributed under the AGPL-3.0-only License. See [`LICENSE`](LICENSE).

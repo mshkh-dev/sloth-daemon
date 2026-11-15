@@ -12,7 +12,7 @@
 
 [Unit]
 Description=Sloth Daemon - AI-assisted eBPF CPU governor
-Documentation=https://github.com/Moeen-19/sloth-daemon
+Documentation=https://github.com/mshkh-dev/sloth-daemon
 # Ordering only: start after Ollama if it is enabled, but never pull it in.
 # Rules mode does not need Ollama, and Ollama uses a lot of memory on small machines.
 After=network.target ollama.service

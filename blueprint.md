@@ -274,28 +274,40 @@ Complete phases **in order**. Do not start a phase until the previous phase's ch
   7. In dry-run mode overrides are still saved, but still no cgroup writes happen.
 - **Exit check:** Tests for validation, atomic write, permit-beats-ban, and "protected names cannot be overridden". User flow: ban `yes` in the UI, run a `yes` loop, see it throttled (non-dry-run run, user executes). Permit `yes`: it is never throttled. Restart the daemon: overrides survive. A malformed overrides file is ignored with a warning, not a crash.
 
-### Phase 10 (optional, not started): Learned Evidence
-Only after Phase 9 is in real use. Record how often the user permits or bans each program name and feed that count to the evidence brief as one more derived feature. It must never bypass the policy gate. Needs a fresh plan and approval before any work, and a decision on SQLite vs a plain file.
+### Phase 10: Arch Linux Packaging (AUR)
 
-## v2 Definition of Done
-Add these to the v1 checklist. Verify by running them.
+- **Goal:** A package a user on Arch can build and install without setting up the toolchain by hand, from a tagged GitHub release, ready to submit to the AUR.
+- **Tasks:**
+  1. **Release prep.** Set the version to `0.2.0` consistently in all `Cargo.toml` files. `Cargo.lock` must be committed and not git-ignored. Make sure `target/` is not tracked. Do not create tags or push anything: the user does that.
+  2. **Build reproducibility.** Document and, if needed, adjust how the eBPF object is built so a PKGBUILD can do it: dependencies fetched in `prepare()` (`cargo fetch --locked`), then `build()` runs with no network (`--frozen`/`--offline`). The nightly toolchain and `rust-src` must come from `rustup` (makedepends), and `bpf-linker` must be a makedepends or a documented requirement. State exactly what the PKGBUILD needs and why. Do not vendor binaries or commit build outputs.
+  3. **PKGBUILD** in `packaging/aur/`: `pkgname=sloth-daemon`, source is the GitHub tag tarball for `v$pkgver`, `sha256sums=('SKIP')` marked clearly for the user to replace after tagging, license `MIT`, `arch=('x86_64')`, `optdepends=('ollama: LLM classification mode')`. `package()` installs: `sloth-daemon` and `sloth-ui` to `/usr/bin`, the unit to `/usr/lib/systemd/system/sloth-daemon.service` with `/usr/local/bin` replaced by `/usr/bin` (use `sed` on the repo unit, keep one source of truth), the default config to `/etc/sloth-daemon/sloth.toml` with `backup=('etc/sloth-daemon/sloth.toml')`, `LICENSE` to `/usr/share/licenses/$pkgname/`, and the README to `/usr/share/doc/$pkgname/`. Nothing outside `/usr` and `/etc`. Do not enable or start the service in the package.
+  4. **`.install` file** with a short post-install message: dry-run is the default, how to start the service, how to run `sloth-ui` (with sudo), where the config is.
+  5. **Local test path.** Give a documented way to test the PKGBUILD before any tag exists (for example a `makepkg` run against a local tarball made with `git archive`), plus the clean-chroot command (`extra-x86_64-build` from `devtools`).
+  6. **README.** Add an "Install on Arch" section (AUR once published; manual build until then) and a short, neutral "Why not X?" section comparing Sloth Daemon to `systemd-run`/`cpulimit` and `ananicy-cpp`: what each does, and where Sloth Daemon differs (throttle not kill, protected list and caps, explainable decisions, optional local model). No overclaiming.
+- **Exit check:** `makepkg -f` succeeds in `packaging/aur/` against the local tarball. `namcap` on the PKGBUILD and the built package is clean, or every remaining warning is explained in one line. `pacman -Qlp *.pkg.tar.zst` lists only paths under `/usr` and `/etc`, with the unit using `/usr/bin`. The user installs it, runs `sloth-daemon --check`, starts the service, and `./scripts/service-check.sh` equivalent checks pass against the packaged paths.
+- **Out of scope:** pushing to the AUR, creating tags, CI, other distributions, signing.
 
-### IPC and Safety
-- [ ] The socket directory and file are not world-accessible, and an unauthorised peer is refused.
-- [ ] Oversized or malformed requests are rejected without crashing or blocking the control loop.
-- [ ] The socket file is removed on SIGINT/SIGTERM, and a stale one is replaced on start.
-- [ ] If IPC fails to start, the daemon still runs as in v1.
-- [ ] No request can throttle, release or signal a PID. Only policy lists change.
-- [ ] `cargo tree -p sloth-daemon` shows no `ratatui` or `crossterm`.
+### Phase 11: Learned Evidence and Profile Manager (deferred)
 
-### UI and Overrides
-- [ ] `sloth-ui` shows active cages and the audit stream from a live daemon, and handles the daemon going away.
-- [ ] The terminal is always restored on exit.
-- [ ] Permit and ban work, survive a restart, and never override the protected list or the policy gate.
-
-### Documentation
-- [ ] README documents the socket path, permissions, `sloth-ui`, overrides and the new config keys.
----
+- **Goal:** Reduce override friction by remembering what the user has permitted or banned, and show it in the UI, without giving the daemon any new power to act on its own.
+- **Why it fits:** It stays local and transparent. v2 already shows *why* the daemon acted and lets the user steer it. Phase 11 lets the daemon remember the user's choices, so the same program is not asked about twice.
+- **Design rules (hard):**
+  1. **Learned data is evidence, not authority.** A profile may only add one derived feature to the `ProcessBrief` (for example `user_history: banned_n / permitted_n` for that program name). The policy gate is unchanged. A profile can never throttle by itself, never skip the sustained-load, confidence, cap or quota-floor checks, and never touch the protected list.
+  2. **Explicit user actions only.** Counts change only when the user presses permit, ban or clear (or sends the same request over the socket). The daemon never infers approval from silence or from "no override".
+  3. **Local and minimal.** Store program names (the same validated names as overrides) and counters only. No command lines, paths, arguments or usernames. No network.
+  4. **Plain file first.** Use a small versioned TOML or JSON file in `/var/lib/sloth-daemon/` with atomic writes, as for overrides. SQLite only if the plain file is shown to be insufficient, and that needs the user's approval as a new dependency.
+  5. **Bounded.** Max 500 profiles, oldest-unused evicted. A malformed file is backed up to `.bad` and ignored, as for overrides.
+  6. **Explicit overrides win.** Permit and ban from Phase 9 always beat anything learned.
+- **Tasks:**
+  1. Add a `profiles` store next to the override store: load on start, atomic persist, bounded, validated names.
+  2. Record permit, ban and clear events into per-name counters (with a last-seen timestamp for eviction).
+  3. Feed the counters into the evidence broker as one derived feature. Include it in the LLM prompt only as a bucketed value (none, some, many), never raw history.
+  4. Protocol: add a read-only `profiles` request and a mutating `profile {name, mode}` request, where mode is `auto`, `always_throttle` or `never_throttle`. `always_throttle` behaves exactly like a ban and `never_throttle` exactly like a permit, so the existing safeguards apply. `auto` clears the explicit choice and leaves only the learned counters.
+  5. `sloth-ui`: a third view, **Profiles**, with a table (name, mode, permits, bans, last seen) and single-key changes. No charts.
+  6. Audit reasons: when learned history influenced a decision, say so in the decision `reason` (for example "user previously permitted this program 4 times"), and only then.
+  7. Config: `[profiles] enabled = true`, `path`, `max_entries`.
+- **Exit check:** Tests for the bounded store, the atomic write and reload, the malformed-file path, and eviction. A test through the real classification path shows that a program with many learned bans but no sustained load is NOT throttled, and a protected name with any history is never throttled. Live: permit a program three times, confirm the Profiles view shows it and the audit reason mentions the history, restart the daemon and confirm it persisted. A new `scripts/profiles-check.sh` automates the live part.
+- **Out of scope:** Any automatic throttling based on learned data alone, SQLite (unless approved), remote or cloud sync, ML models, charts, resource graphs.
 
 ## Definition of Done
 
@@ -329,57 +341,37 @@ The project is done when **every** box below is true and has been verified by ru
 - [x] Leftover cgroups from a prior crash are cleaned on startup.
 - [x] No code path kills, stops, or re-prioritises a process by any other means.
 
+### IPC and Safety
+- [ ] The socket directory and file are not world-accessible, and an unauthorised peer is refused.
+- [ ] Oversized or malformed requests are rejected without crashing or blocking the control loop.
+- [ ] The socket file is removed on SIGINT/SIGTERM, and a stale one is replaced on start.
+- [ ] If IPC fails to start, the daemon still runs as in v1.
+- [ ] No request can throttle, release or signal a PID. Only policy lists change.
+- [ ] `cargo tree -p sloth-daemon` shows no `ratatui` or `crossterm`.
+
+### UI and Overrides
+- [ ] `sloth-ui` shows active cages and the audit stream from a live daemon, and handles the daemon going away.
+- [ ] The terminal is always restored on exit.
+- [ ] Permit and ban work, survive a restart, and never override the protected list or the policy gate.
+
+### Arch Linux Packaging
+- [ ] Versions are 0.2.0 everywhere, `Cargo.lock` is committed, `target/` is untracked.
+- [ ] `makepkg` builds the package with no network access in `build()`.
+- [ ] `namcap` is clean or explained.
+- [ ] The package installs only under `/usr` and `/etc`, the config is in `backup=()`, and the service is not enabled by the package.
+- [ ] A fresh install on the user's machine starts and passes a dry-run check.
+- [ ] README has the Arch install section and the "Why not X?" comparison.
+
+### Learned Evidence & Profile Manager
+- [ ] Learned data only adds a derived feature to the brief. The gate and the protected list are unchanged, and tests prove it.
+- [ ] Profiles are bounded, validated, atomically written and survive restart.
+- [ ] A malformed profiles file does not stop the daemon.
+- [ ] Explicit overrides always beat learned history.
+- [ ] The Profiles view works, and the audit stream says when history influenced a decision.
+- [ ] No new third-party dependency without approval.
+
 ### Documentation
 - [x] `README.md` explains installation, privileges, dry-run, and configuration.
 - [x] A systemd unit example is included.
 - [x] Every decision the daemon makes is explained in its logs.### Feature 1: Interactive TUI / Control Center (The Best "UX" Upgrade)
-
-Right now, interaction is mostly config-file driven (`sloth.toml`) and logs.
-
-- **The v2 Feature:** A lightweight terminal user interface (TUI) built in Rust (using `ratatui`) that lets you view live, throttled processes in real-time, temporarily whitelist/blacklist processes with a keystroke, or manually inspect *why* the AI or policy engine decided to slow a specific PID down.
-
-- **Why it fits:** It keeps the tool local, transparent, and terminal-native (matching the Rust/eBPF ecosystem) without needing a heavy web dashboard or background bloat.
-
-### Feature 2: Dynamic Policy Learning / Auto-Profiling
-
-Users have to manually specify `throttle_candidates` in their config.
-
-- **The v2 Feature:** Allow `sloth-daemon` to maintain a local, lightweight SQLite ledger of application behavior over time. If it notices that `cargo build` or a specific heavy python script constantly gets flagged and subsequently user-approved for throttling, it can automatically learn a local profile for it.
-
-- **Why it fits:** It reduces configuration friction and makes the daemon feel truly autonomous without leaking data or requiring cloud connectivity.
-
-
-
-It is a great upgrade—provided you build it as an **interactive control plane and audit log**, not a generic system resource monitor.
-
-If you put CPU bar graphs, RAM gauges, and network throughput charts into your TUI, you are competing directly with `btop` and `htop`—and you will lose. Those tools are built purely for real-time telemetry visualization.
-
-For a background daemon that uses local AI and behavioral profiling to make autonomous decisions, a TUI solves a problem `btop` cannot: **observability and human-in-the-loop training.**
-
-### Where `btop`/`htop` Stop vs. Where `sloth` Starts
-
-- **`btop` shows you *what* is happening:** "Process `cargo` is using 98% CPU."
-
-- **`sloth` TUI shows you *why* it intervened and lets you train Option 3:** "Process `cargo` was throttled to 40% `cpu.max` because it lacked interactive TTY focus and matched a repetitive compute pattern. **[P]ermit burst** | **[B]an** | **[I]nspect AI reasoning**."
-
-### How to Architect It So It Doesn't Bloat the Daemon
-
-A background daemon should stay lean and headless. You should **not** compile `ratatui` directly into the daemon binary or run UI rendering loops inside the core service.
-
-1. **Keep the Daemon Strictly Headless:** `sloth-daemon` runs silently in the background via systemd, collecting eBPF metrics, querying the AI, writing to the SQLite behavioral ledger (Option 3), and managing cgroups.
-
-2. **Expose a Local Unix Domain Socket:** Have `sloth-daemon` expose an IPC socket (e.g., `/run/sloth/sloth.sock`) using lightweight JSON or MessagePack/bincode over Tokio.
-
-3. **Make the TUI a Subcommand Client (`sloth top` or `sloth ui`):** When you run `sloth ui`, the CLI connects to the daemon's socket on demand. When you close the TUI, zero UI overhead remains in memory.
-
-### What the TUI Screens Should Actually Contain
-
-To complement Option 3 (Local Behavioral Profiling) without overlapping with `btop`, limit the TUI to three focused views:
-
-- **Active Cgroup Cages:** Only lists processes currently being governed or watched by `sloth`—showing their current `cpu.max` quota, duration throttled, and the specific trigger reason.
-
-- **AI & Policy Audit Stream:** A live feed of the daemon's reasoning (e.g., *"Ignored `ffmpeg` — matched user-approved media profile"* or *"Throttled `tracker-miner-fs` — high background I/O + CPU loop"*).
-
-- **Profile Manager (The Option 3 Trainer):** A table of learned application profiles stored in SQLite where you can flip a process between **Auto-Learn**, **Always Throttle**, or **Whitelist** with a single keypress, immediately updating the daemon's ruleset without manually editing `sloth.toml`.
-
-Pairing Option 3 with a client-side TUI turns `sloth-daemon` from a "black box" background service into a transparent, self-training tool—something general system monitors aren't designed to do.
+- [ ] README documents the socket path, permissions, `sloth-ui`, overrides and the new config keys.
