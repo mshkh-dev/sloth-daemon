@@ -1,129 +1,155 @@
-# Sloth Daemon: The AI-Assisted CPU Governor
+# Sloth Daemon
 
-Make greedy processes sloth-like, not dead. Sloth Daemon watches CPU usage with an eBPF probe, gathers local evidence about each busy process, optionally asks a small local LLM (Ollama) to judge it, and gently slows genuine runaways with cgroup v2 CPU limits. It never kills anything.
+**Slow down runaway processes instead of killing them.**
 
-## What is Sloth Daemon
+Sloth Daemon is a small Linux daemon written in Rust. It watches CPU use with an eBPF probe, works out whether a busy process is a genuine runaway or legitimate heavy work (a compile, a video encode), and caps the runaways with cgroup v2 `cpu.max`. It never kills, signals or renices anything, and it lifts the cap when the process calms down.
 
-A runaway browser helper, a stuck script, or a forgotten background job can pin a CPU core and make your machine crawl. Sloth Daemon observes per-process CPU time directly in the kernel (no `/proc` polling), builds a compact evidence brief for every process that stays busy, and decides whether it is a runaway or legitimate heavy work like a compile or a video encode. Runaways get a CPU cap. When the process calms down or a time limit expires, the cap is lifted.
+> **Status: v0.2.0, tested on one machine** (Arch Linux, kernel 7.2.11). It runs in dry-run mode by default, so you can watch what it *would* do before letting it act. See [Tested on](#tested-on) and [Limitations](#limitations).
 
-Everything runs on your machine. In the default mode there is no network access at all. In the optional LLM mode the only network call is to your local Ollama server.
+## Contents
 
-## How It Works
+- [Why it exists](#why-it-exists)
+- [Install](#install)
+- [Quick start (5 minutes, safe)](#quick-start-5-minutes-safe)
+- [How it works](#how-it-works)
+- [Safety model](#safety-model)
+- [Configuration](#configuration)
+- [Running as a service](#running-as-a-service)
+- [sloth-ui and runtime overrides](#sloth-ui-and-runtime-overrides)
+- [Verifying it works](#verifying-it-works)
+- [Why not an existing tool?](#why-not-an-existing-tool)
+- [Tested on](#tested-on) · [Limitations](#limitations) · [Troubleshooting](#troubleshooting) · [Contributing](#contributing) · [License](#license)
 
-1. **Observe:** an eBPF program (aya) attached to the `sched:sched_switch` tracepoint accumulates on-CPU time per task in a kernel map.
-2. **Sample:** the user-space daemon reads that map on an interval and turns the deltas into CPU percentages per process.
-3. **Gather evidence:** a deterministic broker compiles derived local facts into a `ProcessBrief`: CPU trend and burstiness, how long the process has been busy, name and parent category, thread count, memory size bucket, session kind, system CPU pressure, and a preliminary rule verdict. Command lines, environment variables, paths and usernames are never included.
-4. **Classify:** the brief is turned into a typed verdict (`essential`, `interactive`, `background`, `runaway`, or `unknown`) either by the rules alone or by a local LLM reading the brief (see the two modes below).
-5. **Decide:** a deterministic policy gate makes the final call. The AI is advisory only and can never override the protected list or the never-throttle list.
-6. **Enforce:** approved targets are moved into a child cgroup under `/sys/fs/cgroup/sloth-daemon/` with a `cpu.max` quota, then released later.
+## Why it exists
 
-### Two classification modes
+A stuck script, a runaway browser helper or a forgotten build loop can pin a CPU core and make a machine crawl. The usual answers are blunt: kill it, hope `nice` helps, or wait. Sloth Daemon takes a gentler route: give the process a smaller slice of CPU, keep it alive, and hand the slice back once it calms down.
 
-| Mode | Setting | Needs | What decides |
-|:--|:--|:--|:--|
-| Rules (default) | `provider = "rules"` | Nothing | The evidence broker's preliminary verdict, built from your `never_throttle` and `throttle_candidates` lists plus the process evidence |
-| Local LLM | `provider = "ollama"` | Ollama and a small model | A local model reads the `ProcessBrief` and returns a typed verdict. It can confirm or lower a throttle, never override the protected list |
+Everything runs on your machine. In the default mode there is no network access at all. In the optional LLM mode, the only network call is to your own local Ollama server.
 
-If Ollama is unreachable or returns bad output, the verdict is `unknown` and nothing is throttled, unless you set `fallback_to_rules = true`.
+## Install
 
-**Default behaviour:** in rules mode, nothing is throttled until you add program names to `throttle_candidates`. A busy process that isn't on that list is classified `unknown` and left alone, so a fresh install is safe even with `dry_run = false`.
+### Arch Linux
 
-## Architecture and Tech Stack
+An AUR package is **planned and not published yet**. A package can be built from this repository today:
 
-| Component | Technology | Purpose |
-|:--|:--|:--|
-| Kernel probe | Rust, `aya-ebpf` | Per-process CPU accounting with minimal overhead |
-| Daemon | Rust, `aya`, `tokio` | Loading the probe, sampling, control loop |
-| Evidence broker | Rust (`broker.rs`) | Derived `ProcessBrief`, metric history, deterministic category rules |
-| Policy gate | Rust (`policy.rs`) | Pure, table-tested decision function with hysteresis and expiry |
-| AI classifier | Ollama (local HTTP API), `reqwest` | Structured JSON verdicts from the evidence brief (optional) |
-| Enforcement | cgroup v2 (`cpu.max`, `cgroup.procs`) | Reversible CPU throttling |
-| Observability | `tracing` | Structured logs explaining every decision |
-| Agent workflow | `agy` with `.agents/skills/` | Guided, rule-bound development |
+```bash
+git clone https://github.com/mshkh-dev/sloth-daemon.git
+cd sloth-daemon/packaging/aur
+makepkg -si
+```
 
-## Safety Model
+The package installs `sloth-daemon` and `sloth-ui` into `/usr/bin/`, the default config to `/etc/sloth-daemon/sloth.toml`, and the systemd unit to `/usr/lib/systemd/system/sloth-daemon.service`. **It does not enable or start the service.** To build, it needs `rustup` and `bpf-linker` (both in the official repos or installed by the PKGBUILD's makedepends).
 
-- **Dry run by default.** Nothing is written to `/sys/fs/cgroup` unless `dry_run = false` is set explicitly.
-- **No killing.** No signals, no `nice`, no CPU affinity changes. Only cgroup `cpu.max` and moving PIDs between cgroups.
-- **Protected processes.** PID 1, the daemon itself, kernel threads, and core services (for example `systemd`, `sshd`, display servers, audio, and `ollama`) are never throttled.
-- **Limits on every throttle.** A minimum quota of 5% of one core, a cap on how many processes can be throttled at once, and an automatic expiry time.
-- **No flapping.** A throttled process is released only after it stays calm (well below its quota) for a cool-down period, so the cap itself cannot trigger an immediate release.
-- **Fail safe.** Errors, timeouts, malformed model output or missing data mean the process is left alone.
-- **Clean exit.** On shutdown, `SIGINT` or `SIGTERM`, every throttle is released and the daemon's cgroups are removed.
-- **Crash recovery.** If the daemon is killed, leftover cgroups are cleaned on the next start. Because the original cgroup is only remembered in memory, recovered processes are moved to the root cgroup.
-- **Private by design.** Prompts contain only derived `ProcessBrief` facts. Never command lines, environments, raw paths, or usernames.
+### From source (any Linux)
 
-## Requirements
-
-- Linux with **cgroup v2** (unified hierarchy) mounted at `/sys/fs/cgroup`
-- A kernel with BTF (`/sys/kernel/btf/vmlinux` exists) and the `sched_switch` tracepoint
-- Root, or the capabilities `CAP_BPF` and `CAP_PERFMON` (the systemd unit runs as root with only these two)
-- Rust stable plus a **nightly** toolchain with `rust-src` for the eBPF crate
-- `bpf-linker`
-- *Optional, LLM mode only:* [Ollama](https://ollama.com) with a small model. The daemon speaks Ollama's HTTP API; other backends (llama.cpp server, vLLM) are not supported. The recommended minimum model is `qwen2.5:0.5b` (roughly 400 MB).
-
-Check cgroup v2 and BTF quickly:
+You need Linux with **cgroup v2** and **BTF**, a pinned **nightly** Rust toolchain with `rust-src` (for the eBPF program), and `bpf-linker`.
 
 ```bash
 stat -fc %T /sys/fs/cgroup        # expect: cgroup2fs
 ls /sys/kernel/btf/vmlinux        # expect: the file exists
 ```
 
-## Quick Start and Installation
+```bash
+git clone https://github.com/mshkh-dev/sloth-daemon.git
+cd sloth-daemon
 
-1. **Clone the repository:**
+# One-time toolchain setup. The repo pins its nightly in rust-toolchain.toml.
+rustup toolchain install nightly-2026-10-23 --profile minimal --component rust-src
+sudo pacman -S bpf-linker            # Arch. Elsewhere: cargo install bpf-linker
 
-   ```bash
-   git clone https://github.com/mshkh-dev/sloth-daemon.git
-   cd sloth-daemon
-   ```
+# Build as your normal user, not root.
+cargo build --package sloth-ebpf --target bpfel-unknown-none -Z build-std=core --release
+cargo build --release -p sloth-daemon -p sloth-ui
+```
 
-2. **Install the toolchain (one time):**
+The binaries are in `target/release/`. (If you change the pinned nightly, change it in `rust-toolchain.toml` and in the PKGBUILD together.)
 
-   ```bash
-   rustup toolchain install nightly --component rust-src
-   cargo install bpf-linker
-   ```
+## Quick start (5 minutes, safe)
 
-3. **Build (as your normal user, not root):**
+Dry-run is the default, so none of this writes to your cgroups. If you installed the Arch package, use `sloth-daemon` and `/etc/sloth-daemon/sloth.toml`. From a source build, use `sudo ./target/release/sloth-daemon --config sloth.toml` and `sudo ./target/release/sloth-ui`.
 
-   ```bash
-   # Kernel-side eBPF program
-   cargo +nightly build --package sloth-ebpf \
-     --target bpfel-unknown-none -Z build-std=core --release
+**1. Check your system:**
 
-   # Daemon (embeds the eBPF object)
-   cargo build --release -p sloth-daemon
-   ```
+```bash
+sudo sloth-daemon --check
+```
 
-4. **Check your system, then run in dry-run mode first:**
+**2. Start the daemon** (terminal 1):
 
-   ```bash
-   sudo ./target/release/sloth-daemon --check
-   sudo ./target/release/sloth-daemon --config sloth.toml --debug
-   ```
+```bash
+sudo systemctl start sloth-daemon         # package install
+# or from a source build:
+sudo ./target/release/sloth-daemon --config sloth.toml --debug
+```
 
-   In dry-run mode the daemon logs what it *would* throttle and writes nothing. Watch the logs for a while and make sure the decisions look right.
+**3. Open the terminal UI** (terminal 2):
 
-5. **Enable real throttling** only when you are happy with the dry-run output: set `dry_run = false` in `sloth.toml`, add the programs you are happy to slow down to `throttle_candidates`, and restart.
+```bash
+sudo sloth-ui
+```
 
-6. **Optional, LLM mode:** install Ollama, pull the small recommended model, and set `provider = "ollama"`:
+**4. Make some noise** (terminal 3). In the default rules mode, **nothing is throttled until you say which programs may be**, so for this demo tell it that `yes` may be. In the UI you can do that by pressing `b` on a `yes` row once it appears, or add `throttle_candidates = ["yes"]` to the config. Then:
 
-   ```bash
-   # Arch Linux (CPU build). On other distros use the installer from ollama.com
-   sudo pacman -S ollama
-   sudo systemctl enable --now ollama
-   ollama pull qwen2.5:0.5b
-   curl -s http://localhost:11434/api/tags      # should list the model
-   ```
+```bash
+yes > /dev/null
+```
 
-   Then set `provider = "ollama"`, `model = "qwen2.5:0.5b"` and `timeout_secs = 60` in `sloth.toml`. The first request after a cold start can take a while on old CPUs, so keep the timeout generous. Bigger models work too but are slow on old hardware. In LLM mode the model reads the evidence brief and can confirm or lower a throttle. It cannot raise one: a process must also be allowed by the rules (for example listed in `throttle_candidates`).
+After about 30 seconds of sustained load the daemon decides. In dry-run mode you will see lines like these in the log (from a real run):
 
-   To try LLM mode safely (dry run only, one test process), run `./scripts/llm-check.sh`. Stop Ollama afterwards with `sudo systemctl stop ollama` to free memory.
+```text
+Policy decision pid=57451 comm=yes cpu_percent=104.5 classification=Background confidence=0.85 action=None dry_run=true reason=cpu not sustained long enough
+Policy decision pid=57451 comm=yes cpu_percent=99.9 classification=Runaway confidence=0.85 action=Throttle { pid: 57451, quota_pct: 20 } dry_run=true reason=valid runaway workload justifies throttle
+DRY-RUN: would throttle process to cgroup cpu.max pid=57451 comm="yes" quota_pct=20 dry_run=true
+```
+
+Press `Ctrl+C` on `yes` when you are done. When you are happy with what you see, set `dry_run = false` in the config, list the programs you are happy to slow down in `throttle_candidates`, and restart.
+
+## How it works
+
+1. **Observe.** An eBPF program (aya) on the `sched:sched_switch` tracepoint accumulates on-CPU time per task in a kernel map. No `/proc` polling.
+2. **Sample.** The daemon reads that map every couple of seconds and turns the deltas into CPU percentages per process.
+3. **Gather evidence.** A deterministic *evidence broker* builds a compact `ProcessBrief` for every process that stays busy: CPU trend and burstiness, how long it has been busy, program and parent category (compiler, encoder, browser helper, ...), thread count, memory bucket, session kind, system CPU pressure, and a preliminary rule verdict. **Command lines, environment variables, file paths and usernames are never included.**
+4. **Classify.** The brief becomes a typed verdict (`essential`, `interactive`, `background`, `runaway` or `unknown`), by rules alone or with a local LLM (below).
+5. **Decide.** A deterministic *policy gate* makes the final call. The AI is advisory: it can confirm or veto a throttle, never start one, and never override the protected list.
+6. **Enforce.** Approved targets are moved into a child cgroup under `/sys/fs/cgroup/sloth-daemon/` with a `cpu.max` quota, then released later.
+
+### Two classification modes
+
+| Mode | Setting | Needs | What decides |
+|:--|:--|:--|:--|
+| Rules (default) | `provider = "rules"` | Nothing | The broker's preliminary verdict, from your `never_throttle` and `throttle_candidates` lists plus the process evidence |
+| Local LLM | `provider = "ollama"` | Ollama and a small model | A local model reads the `ProcessBrief` and returns a typed verdict. It can confirm or lower a throttle, never raise one or override the protected list |
+
+If Ollama is unreachable or returns bad output, the verdict is `unknown` and nothing is throttled, unless you set `fallback_to_rules = true`.
+
+**Default behaviour:** in rules mode, nothing is throttled until you add program names to `throttle_candidates` (or ban them from `sloth-ui`). A busy process that is not on the list is classified `unknown` and left alone, so a fresh install is safe even with `dry_run = false`.
+
+### LLM mode (optional)
+
+```bash
+sudo pacman -S ollama                    # Arch. Elsewhere: the installer from ollama.com
+sudo systemctl enable --now ollama
+ollama pull qwen2.5:0.5b                 # about 400 MB, the recommended minimum
+curl -s http://localhost:11434/api/tags  # should list the model
+```
+
+Then set `provider = "ollama"`, `model = "qwen2.5:0.5b"` and `timeout_secs = 60` in the config. The first request after a cold start can be slow on old CPUs, so keep the timeout generous. Only the Ollama HTTP API is supported (not llama.cpp server or vLLM). To try it safely (dry run, one test process) run `./scripts/llm-check.sh`. Stop Ollama afterwards with `sudo systemctl stop ollama` to free memory.
+
+## Safety model
+
+- **Dry run by default.** Nothing is written to `/sys/fs/cgroup` unless `dry_run = false` is set explicitly.
+- **No killing.** No signals, no `nice`, no CPU affinity changes. Only cgroup `cpu.max` and moving PIDs between cgroups.
+- **Protected processes.** PID 1, the daemon itself, kernel threads, and core services (`systemd`, `sshd`, display servers, audio, `ollama`, ...) are never throttled. Nothing, including the AI and your overrides, can change that.
+- **Limits on every throttle.** A minimum quota of 5% of one core, a cap on how many processes can be throttled at once, and an automatic expiry time.
+- **No flapping.** A throttled process is released only after it stays calm (well below its quota) for a cool-down period, so the cap itself cannot trigger an immediate release.
+- **Fail safe.** Errors, timeouts, malformed model output or missing data mean the process is left alone.
+- **Clean exit and crash recovery.** On shutdown, `SIGINT` or `SIGTERM`, every throttle is released and the daemon's cgroups are removed. If the daemon is killed, leftovers are cleaned on the next start. Because the original cgroup is only remembered in memory, recovered processes are moved to the root cgroup.
+- **Private by design.** Prompts contain only derived `ProcessBrief` facts.
+- **A local control socket that cannot act on processes.** See [below](#sloth-ui-and-runtime-overrides).
 
 ## Configuration
 
-Settings live in `sloth.toml`. Every value has a default in code.
+Settings live in `sloth.toml` (`/etc/sloth-daemon/sloth.toml` for the package or service install). Every value has a default in code.
 
 ```toml
 dry_run = true                 # keep true until you trust the decisions
@@ -154,27 +180,93 @@ throttle_candidates = []       # rules mode: names it may throttle. Empty = noth
 extra_names = []               # added to the built-in protected list
 
 [ipc]
-enabled = true                 # enable or disable IPC control socket
-socket_path = "/run/sloth/sloth.sock" # path to Unix domain socket
-history = 256                  # ring buffer capacity for policy decisions
-group = ""                     # optional Unix group allowed socket access (default none)
-overrides_path = "/var/lib/sloth-daemon/overrides.toml" # overrides persistence file
+enabled = true                 # enable or disable the control socket
+socket_path = "/run/sloth/sloth.sock"
+history = 256                  # how many recent decisions are kept for the UI
+group = ""                     # optional Unix group allowed to use the socket (default: root only)
+overrides_path = "/var/lib/sloth-daemon/overrides.toml"
 ```
 
 **Built-in always-protected names:** `systemd`, `systemd-*`, `sshd`, `dbus-daemon`, `Xorg`, `Xwayland`, `gnome-shell`, `kwin_*`, `pipewire`, `pulseaudio`, `NetworkManager`, `ollama`.
 
-## Verifying It Works
+## Running as a service
 
-Two scripts run the full checks in one terminal. They need sudo, start a harmless `yes` busy loop, and only ever throttle that one process:
+**With the Arch package** the unit is already installed:
 
 ```bash
-./scripts/e2e-phase5.sh --build      # throttle, CPU drop, release, cleanup
-sudo ./scripts/crash-recovery.sh     # SIGKILL the daemon, restart, check cleanup
+sudo systemctl enable --now sloth-daemon
+journalctl -u sloth-daemon -f
 ```
 
-Build as your normal user first (`cargo build --release -p sloth-daemon`) before running `crash-recovery.sh`, since it runs as root and root usually has no Rust toolchain.
+**From a source build**, install the binary, config and unit by hand:
 
-To check by hand, start a hog and wait for it to stay busy past `sustained_secs`:
+```bash
+sudo cp target/release/sloth-daemon target/release/sloth-ui /usr/local/bin/
+sudo mkdir -p /etc/sloth-daemon
+sudo cp sloth.toml /etc/sloth-daemon/sloth.toml
+sudo cp sloth-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sloth-daemon
+```
+
+The unit runs as root with only `CAP_BPF` and `CAP_PERFMON`, and has been tested under systemd (throttle, release, `SIGTERM` shutdown, no leftovers). Cgroup operations need no extra capability because they are checked by file permissions. The unit creates `/run/sloth` and `/var/lib/sloth-daemon` through `RuntimeDirectory=` and `StateDirectory=`, because `ProtectSystem=strict` makes the rest of the filesystem read-only. If your system behaves differently, `journalctl -u sloth-daemon` will say which operation failed.
+
+## sloth-ui and runtime overrides
+
+The daemon is headless. It serves a local Unix socket at `/run/sloth/sloth.sock`, and `sloth-ui` is a separate terminal client that connects to it on demand. Nothing UI-related runs inside the daemon.
+
+```bash
+sudo sloth-ui
+```
+
+The socket directory is mode `0750` and the socket `0600`, both owned by `root` (systemd creates the directory when it runs as a service), so `sloth-ui` needs `sudo` unless you configure a socket `group`. If the socket cannot be created, or `[ipc] enabled = false`, the daemon runs normally without it.
+
+**It is not a system monitor.** It has no CPU bars or process list. That is what `htop` and `btop` are for. `sloth-ui` explains what the *daemon* did and why, and lets you steer it:
+
+| View | Shows |
+|:--|:--|
+| **Active Cages** | Processes currently throttled: quota, time throttled, time left, the reason |
+| **Audit Stream** | Recent decisions, newest first, with the reason for each. Only processes that crossed the CPU threshold appear, which is why a normal idle process is never listed |
+
+Keys: `Tab` switches view, `↑`/`↓` select, `Enter` shows the full reason, `q` quits, and on a selected process:
+
+| Key | Override | Effect |
+|:--|:--|:--|
+| `p` | **permit** | Never throttle this program name (marked `[P]`). Beats `ban`. |
+| `b` | **ban** | Treat this program as a throttle candidate (marked `[B]`). Sustained load, confidence, the cap and the quota floor all still apply. |
+| `c` | **clear** | Remove the override. |
+
+Protected processes cannot be overridden. Overrides take effect immediately, and survive restarts in `/var/lib/sloth-daemon/overrides.toml` (mode `0600`, written atomically).
+
+**The socket cannot act on a process.** By design it can only change these policy lists. It can never throttle, release or signal a PID. Because you can only press a key on a process that has appeared in a view, you can also set an override for a program that is not busy right now over the socket directly. The socket is root-only, so these need `sudo`; `socat` is optional and `python3` works too:
+
+```bash
+# Status
+sudo python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/sloth/sloth.sock'); s.sendall(b'{\"proto\":1,\"cmd\":\"status\"}\n'); print(s.recv(4096).decode())"
+
+# Permit a program, with socat
+echo '{"proto":1,"cmd":"override","name":"ffmpeg","mode":"permit"}' | sudo socat - UNIX-CONNECT:/run/sloth/sloth.sock
+
+# List overrides
+echo '{"proto":1,"cmd":"overrides"}' | sudo socat - UNIX-CONNECT:/run/sloth/sloth.sock
+```
+
+## Verifying it works
+
+The scripts below need `sudo`, run in dry-run mode unless noted, and only ever involve a harmless `yes` loop. Build as your normal user first, because root usually has no Rust toolchain.
+
+| Script | Checks |
+|:--|:--|
+| `./scripts/e2e-phase5.sh --build` | Throttle, CPU drop, release, cleanup (this one performs a real throttle of the `yes` process) |
+| `sudo ./scripts/crash-recovery.sh` | `SIGKILL` the daemon, restart, check cleanup |
+| `./scripts/ipc-check.sh` | Socket permissions, status, bad requests, non-root refusal, cleanup |
+| `./scripts/overrides-check.sh` | Ban, permit, protected names, persistence, malformed file |
+| `./scripts/edge-check.sh` | Stale socket, IPC disabled, idle clients |
+| `./scripts/service-check.sh` | Runs under systemd with the repo's unit file |
+| `./scripts/pkg-check.sh` | Inspects (and tests, once installed) the built Arch package |
+| `./scripts/llm-check.sh` | Live Ollama check |
+
+To check by hand:
 
 ```bash
 yes > /dev/null &
@@ -183,129 +275,36 @@ cat /sys/fs/cgroup/sloth-daemon/pid-<PID>/cpu.max      # e.g. "20000 100000"
 top -b -n 2 -d 2 -p <PID> | tail -2                    # roughly 20% CPU
 ```
 
-After stopping the daemon with `Ctrl+C`, confirm cleanup:
+After stopping the daemon, confirm cleanup (`ls -d /sys/fs/cgroup/sloth-daemon/pid-*` should match nothing) and `kill <PID>` your test process.
 
-```bash
-ls -d /sys/fs/cgroup/sloth-daemon/pid-*                # expect: no matches
-kill <PID>                                             # stop your test process
-```
+## Why not an existing tool?
 
-## Running as a Service
+These tools are mature, widely used and well tested. Sloth Daemon is new and has been tested on one machine. Where they already do the job you need, use them:
 
-A systemd unit file is provided at [`sloth-daemon.service`](sloth-daemon.service). It has been tested as a running service (throttle, release, SIGTERM shutdown and cleanup) with only `CAP_BPF` and `CAP_PERFMON`.
+| Tool | What it does | Where Sloth Daemon differs |
+|:--|:--|:--|
+| `systemd-run` / `CPUQuota=` | Applies a CPU quota to a unit or a transient scope you choose, with nothing extra to install | Sloth watches all processes and applies a time-limited cap automatically, then releases it |
+| `cpulimit` | Limits a PID you name by alternating `SIGSTOP` and `SIGCONT` | Sloth uses cgroup CPU bandwidth, with no signals, so no stop-start stutter, and needs no PID from you |
+| `ananicy` / `ananicy-cpp` | Applies `nice` and scheduler settings from community rules | `nice` only matters when cores are contended. A niced process can still use idle cores. Sloth caps maximum usage |
+| `earlyoom` / `systemd-oomd` | Kill processes under memory pressure | Different problem (memory), and they kill. Sloth only throttles CPU |
 
-```bash
-sudo cp target/release/sloth-daemon /usr/local/bin/
-sudo mkdir -p /etc/sloth-daemon
-sudo cp sloth.toml /etc/sloth-daemon/sloth.toml
-sudo cp sloth-daemon.service /etc/systemd/system/
+What Sloth Daemon adds is automatic, reversible throttling with a hard protected list and caps, crash cleanup, a decision log that explains every action, an optional local model that can only veto, and a human override.
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now sloth-daemon
-journalctl -u sloth-daemon -f
-```
+## Tested on
 
-Capabilities set in the unit: `CAP_BPF` and `CAP_PERFMON`, for loading eBPF and attaching tracepoints. All other capabilities are dropped. The cgroup operations (create directory, write `cpu.max`, move PIDs) need no capability because the service runs as root and they are checked by file permissions. If your system behaves differently, permission errors in `journalctl -u sloth-daemon` will say which operation failed. Note that the unit does not set `ProtectKernelTunables` or `ReadWritePaths`, because the daemon must write under `/sys/fs/cgroup` to release processes back to their original cgroup.
-
-## Tested On
-
-- Arch Linux, cgroup v2, kernel `7.2.11-arch1-1` (unit tests, live throttle/release, crash recovery)
-- systemd service: tested live (throttle, release, SIGTERM, no leftovers)
-- Rules mode: tested live. LLM mode: tested live in dry-run with `qwen2.5:0.5b, gemma3:1b` on Ollama (about 10 s per verdict on an old laptop CPU) and against a mock Ollama server.
+- Arch Linux, cgroup v2, kernel `7.2.11-arch1-1`: unit tests, live throttle and release, crash recovery.
+- systemd service: tested live (throttle, release, `SIGTERM`, no leftovers).
+- v0.2.0: control socket, `sloth-ui`, runtime overrides and the Arch package tested live on the same machine (see `scripts/`).
+- Rules mode tested live. LLM mode tested live in dry-run with `qwen2.5:0.5b` and `gemma3:1b` on Ollama (about 10 s per verdict on an old laptop CPU) and against a mock Ollama server.
 
 ## Limitations
 
 - CPU only. No memory, disk or network throttling.
 - Linux with pure cgroup v2 only. No cgroup v1 or hybrid setups.
-- The LLM sees only derived facts about a process, so it can misjudge unusual workloads. The policy gate, protected list and dry-run mode are the safety net.
-- Small local models are weak. The evidence brief is what makes them usable.
-
-## Project Structure
-
-```
-sloth-daemon/
-├── blueprint.md              # Architecture, phases, Definition of Done
-├── Cargo.lock                # Cargo dependency lockfile
-├── Cargo.toml                # Workspace manifest (sloth-daemon, sloth-ebpf, sloth-proto, sloth-ui)
-├── instructions.md           # Operating rules for the coding agent
-├── LICENSE                   # Project license file
-├── packaging/
-│   └── aur/
-│       ├── PKGBUILD          # Arch User Repository package build script
-│       └── sloth-daemon.install # AUR installation script/hooks
-├── README.md                 # Project overview and documentation
-├── rust-toolchain.toml       # Pinned Rust toolchain configuration
-├── scripts/                  # Automation, validation, and test scripts
-│   ├── crash-recovery.sh     # Crash-recovery integration test (root required)
-│   ├── e2e-phase5.sh         # End-to-end throttle test (needs sudo)
-│   ├── edge-check.sh         # Edge case checking script
-│   ├── ipc-check.sh          # IPC communication verification script
-│   ├── llm-check.sh          # Live Ollama check, dry run only (needs sudo and Ollama)
-│   ├── overrides_check.sh    # Policy override validation script
-│   ├── pkg-check.sh          # Packaging verification script
-│   └── service-check.sh      # Systemd service validation check
-├── sloth-daemon/             # User-space daemon crate
-│   ├── build.rs              # Daemon build script
-│   ├── Cargo.toml            # Crate manifest
-│   └── src/
-│       ├── ai_classifier.rs  # Ollama bridge (optional; rules mode needs no Ollama)
-│       ├── broker.rs         # Evidence broker: ProcessBrief, metric history, rules
-│       ├── cgroup_manager.rs # cgroup v2 enforcement
-│       ├── ipc.rs            # Inter-process communication handler
-│       ├── main.rs           # Config, sampling, control loop, signals
-│       └── policy.rs         # Deterministic policy gate
-├── sloth-daemon.service      # Systemd unit example file
-├── sloth-ebpf/               # Kernel-space eBPF program (aya-ebpf)
-│   ├── Cargo.toml            # Crate manifest
-│   └── src/
-│       └── main.rs           # eBPF kernel program entrypoint
-├── sloth-proto/              # Shared protocol and message definitions crate
-│   ├── Cargo.toml            # Crate manifest
-│   └── src/
-│       └── lib.rs            # Protobuf / IPC schema and type definitions
-├── sloth.toml                # Example runtime configuration file
-└── sloth-ui/                 # User interface frontend crate
-    ├── Cargo.toml            # Crate manifest
-    └── src/
-        └── main.rs           # UI entrypoint
-```
-
-
-## Documentation
-
-- Architectural Blueprint and phase plan: `blueprint.md`
-- Agent operating rules: `instructions.md`
-- Agent skills: `.agents/skills/`
-
-### Arch Linux (AUR)
-
-An AUR package is planned and not published yet; manual build from `packaging/aur/` works today:
-
-```bash
-cd packaging/aur
-makepkg -si
-```
-
-The package installs `sloth-daemon` and `sloth-ui` into `/usr/bin/`, the default config to `/etc/sloth-daemon/sloth.toml`, and the systemd unit to `/usr/lib/systemd/system/sloth-daemon.service`. The service is not enabled automatically.
-
-Verify your environment before enabling the service:
-```bash
-sudo sloth-daemon --check
-sudo systemctl enable --now sloth-daemon.service
-```
-
----
-
-## Why Not Existing Alternatives?
-
-| Tool | Approach | Comparison to Sloth |
-| :--- | :--- | :--- |
-| **systemd slices** / `systemd-run` | Static allocations (`MemoryMax`, `CPUWeight`) or transient cgroup quotas configured per service or user session. | systemd limits whole cgroups statically. Sloth observes dynamic runaway behavior of individual processes across sessions and applies time-bounded throttle cages. |
-| **earlyoom / systemd-oomd** | Triggers `SIGTERM` or `SIGKILL` when memory or swap pressure exceeds critical thresholds. | earlyoom and systemd-oomd terminate processes when RAM/swap is exhausted. Sloth throttles CPU dynamically via CFS bandwidth quotas (`cpu.max`) and never kills or signals processes. |
-| **ananicy / ananicy-cpp** | Adjusts `nice` priority and `ionice` based on predefined community rules. | Ananicy changes static nice/sched priority. A nice 19 process can still consume 100% CPU when cores are idle. Sloth caps maximum core usage via cgroup v2. |
-| **cpulimit** | Userspace tool that sends alternating `SIGSTOP` and `SIGCONT` signals to a target PID. | `cpulimit` induces stutter, pauses interactive apps abruptly, and requires manual PID attachment. Sloth automatically detects workloads using kernel tracepoints and controls them smoothly with hardware cgroup v2 quotas. |
-
----
+- Tested on one machine and one kernel. Please report what happens on yours.
+- The LLM sees only derived facts and small local models are weak. The evidence brief, the policy gate, the protected list and dry-run mode are the safety net.
+- `sloth-ui` needs `sudo` because the socket is root-only (a socket `group` can be configured).
+- Building from source needs a pinned nightly Rust and `bpf-linker`, for the eBPF program.
 
 ## Troubleshooting
 
@@ -313,49 +312,36 @@ sudo systemctl enable --now sloth-daemon.service
 |:--|:--|
 | "cgroup v2 not found" | Run `stat -fc %T /sys/fs/cgroup`. It must print `cgroup2fs`. Hybrid or v1 systems are not supported. |
 | eBPF fails to load | Run as root or grant the capabilities. Check `/sys/kernel/btf/vmlinux` exists and `ls /sys/kernel/tracing/events/sched/`. |
-| Ollama warnings in LLM mode | Ollama is not running or the model is not pulled. Run `curl http://localhost:11434/api/tags`. The daemon throttles nothing in this state unless `fallback_to_rules = true`. |
-| Nothing gets throttled | Check that the process stays above the threshold for the full sustained time, is not protected, is allowed by your `throttle_candidates` / `never_throttle` lists (an empty `throttle_candidates` means nothing is throttled in rules mode), and that `dry_run` is `false`. |
+| `sloth-ui`: "run with sudo" or "daemon not running" | The socket is root-only: use `sudo sloth-ui`. Check `systemctl status sloth-daemon` and that `[ipc] enabled` is `true`. |
+| Ollama warnings in LLM mode | Ollama is not running or the model is not pulled. Run `curl http://localhost:11434/api/tags`. Nothing is throttled in this state unless `fallback_to_rules = true`. |
+| Nothing gets throttled | Check that the process stays above the threshold for the full sustained time, is not protected, is allowed by `throttle_candidates` or a `ban` override (an empty list means nothing is throttled in rules mode), and that `dry_run` is `false`. |
 | `cargo` fails under sudo | Root has no default toolchain. Build as your normal user, then run only the binary or scripts with sudo. |
 | Leftover `sloth-daemon` cgroups | Restart the daemon. It cleans up leftovers on startup. |
+| Old `/usr/local/bin/sloth-daemon` or a unit in `/etc/systemd/system/` shadows the package | Remove them: the `/usr/local/bin` copy comes first in `PATH`, and a unit in `/etc` overrides the packaged one in `/usr/lib`. |
 
-## Runtime Overrides and Control Socket
+## Project structure
 
-Sloth Daemon provides a local Unix domain control socket at `/run/sloth/sloth.sock`. The directory is created with mode `0750` and the socket with mode `0600`, both owned by `root` (created by systemd via `RuntimeDirectory=sloth` when run as a service), so tools like `sloth-ui` require `sudo` unless an authorized group is configured. The daemon continues running normally without the socket if it cannot be created or if `[ipc] enabled = false`.
-
-By design, the control socket can only change policy lists (`permit`, `ban`, `clear`); it can never throttle, release, signal, or directly act on a PID.
-
-Runtime overrides allow steering the daemon's policy dynamically from `sloth-ui` or via the socket without editing `sloth.toml` or restarting:
-- **`permit`**: Never throttle this program name (`comm`). Short-circuits to no action; beats ban.
-- **`ban`**: Treats the program as a throttle candidate. All other safety gate checks (sustained CPU, confidence threshold, cap, and quota floor) still strictly apply.
-- **`clear`**: Removes an existing override for the program name.
-
-Protected system processes (such as `systemd`, `sshd`, and GUI compositors) cannot be overridden by permit or ban.
-
-### Controls in `sloth-ui`
-Select a row in either **Active Cages** or **Audit Stream** and press:
-- `p`: Permit selected process name (never throttle, marked `[P]`)
-- `b`: Ban selected process name (treat as throttle candidate, marked `[B]`)
-- `c`: Clear override on selected process name
-
-Overrides persist across daemon restarts in `/var/lib/sloth-daemon/overrides.toml` (0600 root) using temp-file atomic rename.
-
-### Manual Socket Control
-Mutating requests require root (or membership in the configured socket group). `socat` is optional and `python3` works too:
-```bash
-# Query status with python3
-python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('/run/sloth/sloth.sock'); s.sendall(b'{\"proto\":1,\"cmd\":\"status\"}\n'); print(s.recv(4096).decode())"
-
-# Ban 'yes' using socat
-echo '{"proto":1,"cmd":"override","name":"yes","mode":"ban"}' | sudo socat - UNIX-CONNECT:/run/sloth/sloth.sock
-
-# List overrides using socat
-echo '{"proto":1,"cmd":"overrides"}' | socat - UNIX-CONNECT:/run/sloth/sloth.sock
+```
+sloth-daemon/
+├── sloth-ebpf/                                      # kernel probe (aya-ebpf, no_std)
+├── sloth-daemon/                                    # daemon: broker.rs, policy.rs, ai_classifier.rs,
+│                                                    # cgroup_manager.rs, ipc.rs, main.rs
+├── sloth-proto/                                     # shared IPC protocol types
+├── sloth-ui/                                        # terminal client (ratatui)
+├── packaging/aur/                                   # PKGBUILD and install hooks for Arch
+├── scripts/                                         # live checks (see "Verifying it works")
+├── sloth.toml                                       # example configuration
+├── sloth-daemon.service                             # systemd unit
+├── blueprint.md, instructions.md, .agents/skills/   # the plan and rules used to build it with a coding agent
+└── rust-toolchain.toml                              # pinned nightly for the eBPF crate
 ```
 
 ## Contributing
 
-Development follows the phased plan in `blueprint.md` and the rules in `instructions.md`. If you use a coding agent, point it at those two files first.
+Issues and pull requests are welcome, especially reports from other distributions and kernels. Before sending a change, run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`, and the relevant scripts in `scripts/`. The plan and the rules the project was built under are in `blueprint.md` and `instructions.md`; if you use a coding agent, point it at those first. Parts of the code were written with a coding agent, and every phase was verified by running it, as the scripts in `scripts/` show.
+
+This daemon runs as root with eBPF, so please report a security issue privately (contact@mshkh.is-a.dev) and not in a public issue.
 
 ## License
 
-Distributed under the AGPL-3.0-only License. See [`LICENSE`](LICENSE).
+Distributed under the **AGPL-3.0-only** license. See [`LICENSE`](LICENSE).
