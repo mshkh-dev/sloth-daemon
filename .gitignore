@@ -30,4 +30,9 @@ logs/
 # OS artifacts
 .DS_Store
 Thumbs.db
-```/target
+/target
+/packaging/aur/src/
+/packaging/aur/pkg/
+/packaging/aur/*.pkg.tar.zst
+/packaging/aur/*.tar.gz
+/packaging/aur/*.log
